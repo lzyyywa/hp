@@ -1,22 +1,19 @@
 import os
 import random
-
-from torch.utils.data.dataloader import DataLoader
 import tqdm
-import test as test
-from loss import *
-from loss import KLLoss
-import torch.multiprocessing
 import numpy as np
 import json
-import math
-from utils.ade_utils import emd_inference_opencv_test
-from collections import Counter
+import torch
+from torch.utils.data.dataloader import DataLoader
+import torch.nn.functional as F
 
-from utils.hsic import hsic_normalized_cca
-
+import test as test
+# [NEW] Import Helper and the Encapsulated Loss
+from loss import H2EMTotalLoss
+from utils.hierarchy_helper import HierarchyHelper
 
 def cal_conditional(attr2idx, obj2idx, set_name, daset):
+    # (Keep the original logic unchanged)
     def load_split(path):
         with open(path, 'r') as f:
             loaded_data = json.load(f)
@@ -37,14 +34,11 @@ def cal_conditional(attr2idx, obj2idx, set_name, daset):
     for item in used_data:
         verb_idx = attr2idx[item[1]]
         obj_idx = obj2idx[item[2]]
-
         v_o[verb_idx, obj_idx] += 1
 
     v_o_on_v = v_o / (torch.sum(v_o, dim=1, keepdim=True) + 1.0e-6)
     v_o_on_o = v_o / (torch.sum(v_o, dim=0, keepdim=True) + 1.0e-6)
-
     return v_o_on_v, v_o_on_o
-
 
 def evaluate(model, dataset, config):
     model.eval()
@@ -62,42 +56,40 @@ def evaluate(model, dataset, config):
     )
     result = ""
     key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
-
     for key in key_set:
-        # if key in key_set:
         result = result + key + "  " + str(round(test_stats[key], 4)) + "| "
     print(result)
     model.train()
     return loss_avg, test_stats
 
-
 def save_checkpoint(state, save_path, epoch, best=False):
     filename = os.path.join(save_path, f"epoch_resume.pt")
     torch.save(state, filename)
 
+def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
+    # =========================================================================
+    # [STEP 1] Initialize Hierarchy Helper
+    # =========================================================================
+    print("[Train] Initializing Hierarchy Helper...")
+    helper = HierarchyHelper(train_dataset, root_dir='codes/dataset')
+    
+    # Inject text information into the model
+    coarse_verbs, coarse_objs = helper.get_coarse_info()
+    model.set_hierarchy_prompts(coarse_verbs, coarse_objs, train_dataset.pairs)
+    
+    # Get mapping tables (GPU Tensor)
+    v2cv, o2co, p2v, p2o = helper.get_mappings()
+    v2cv, o2co, p2v, p2o = v2cv.cuda(), o2co.cuda(), p2v.cuda(), p2o.cuda()
+    
+    print("[Train] Hierarchy mappings ready.")
 
-# ========conditional train=
-def rand_bbox(size, lam):
-    W = size[-2]
-    H = size[-1]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = np.int_(W * cut_rat)
-    cut_h = np.int_(H * cut_rat)
-
-    # uniform
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
-
-
-def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset,
-                scaler):
+    # =========================================================================
+    # [STEP 2] Instantiate the Encapsulated Loss
+    # =========================================================================
+    # Use the H2EMTotalLoss we defined in loss.py
+    # Coefficients: Beta1(DA)=1.0, Beta2(TE)=0.1, Beta3(Prim)=0.5
+    criterion = H2EMTotalLoss(temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5).cuda()
+    
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.train_batch_size,
@@ -109,89 +101,65 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     model.train()
     best_loss = 1e5
     best_metric = 0
-    Loss_fn = CrossEntropyLoss()
     log_training = open(os.path.join(config.save_path, 'log.txt'), 'w')
 
-    attr2idx = train_dataset.attr2idx
-    obj2idx = train_dataset.obj2idx
-
-    train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
-                                for attr, obj in train_dataset.train_pairs]).cuda()
-
-    train_losses = []
-
     for i in range(config.epoch_start, config.epochs):
-        progress_bar = tqdm.tqdm(
-            total=len(train_dataloader), desc="epoch % 3d" % (i + 1)
-        )
-
-        epoch_train_losses = []
-        epoch_com_losses = []
-        epoch_oo_losses = []
-        epoch_vv_losses = []
+        progress_bar = tqdm.tqdm(total=len(train_dataloader), desc="epoch % 3d" % (i + 1))
+        
+        # Loss recorders
+        loss_meters = {"Total": [], "Prim": [], "DA": [], "TE": []}
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
+        
         for bid, batch in enumerate(train_dataloader):
+            batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
-            batch_img = batch[0].cuda()
+
             with torch.cuda.amp.autocast(enabled=True):
-                # ========== Modified for Ablation Study ==========
-                # Correctly unpack 3 values (verb, obj, composition)
-                p_v, p_o, f = model(batch_img)
-
-                # Composition Loss
-                train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
-                pred_com_train = f[:, train_v_inds, train_o_inds]
-                loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
-
-                # Component Loss (Important for maintaining component scores)
-                loss_verb = Loss_fn(p_v * config.cosine_scale, batch_verb)
-                loss_obj = Loss_fn(p_o * config.cosine_scale, batch_obj)
-
-                # Total Loss
-                loss = loss_com + 0.2 * (loss_verb + loss_obj)
-
+                # 1. Forward propagation
+                out = model(batch_img)
+                
+                # 2. Calculate loss (call the encapsulated logic in loss.py)
+                # Pass all required mapping tables: p2v, p2o (for DA and Comp constraints), v2cv, o2co (for Prim constraints)
+                loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
+                                          p2v, p2o, v2cv, o2co)
+                
                 loss = loss / config.gradient_accumulation_steps
 
-            # Accumulates scaled gradients.
+            # 3. Backward propagation
             scaler.scale(loss).backward()
 
-            # weights update
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
-                scaler.unscale_(optimizer)  # TODO:May be the reason for low acc on verb
-                # scaler.step(prompt_optimizer)
+                scaler.unscale_(optimizer)
                 scaler.step(optimizer)
                 scaler.update()
-
-                # prompt_optimizer.zero_grad()
                 optimizer.zero_grad()
 
-            epoch_train_losses.append(loss.item())
+            # 4. Record loss values
+            for k, v in loss_dict.items():
+                loss_meters[k].append(v)
 
-            # Record component losses for debugging
-            epoch_com_losses.append(loss_com.item())
-            epoch_vv_losses.append(loss_verb.item())
-            epoch_oo_losses.append(loss_obj.item())
-
-            progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
+            progress_bar.set_postfix({
+                "Total": f"{np.mean(loss_meters['Total'][-50:]):.3f}",
+                "DA":    f"{loss_dict['DA']:.3f}",
+                "Prim":  f"{loss_dict['Prim']:.3f}"
+            })
             progress_bar.update()
 
-            # break
         lr_scheduler.step()
         progress_bar.close()
-        progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
-        train_losses.append(np.mean(epoch_train_losses))
-        log_training.write('\n')
-        log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
+        
+        # Epoch Summary
+        avgs = {k: np.mean(v) for k, v in loss_meters.items()}
+        print(f"Epoch {i+1} | Total: {avgs['Total']:.4f} | Prim: {avgs['Prim']:.4f} | DA: {avgs['DA']:.4f} | TE: {avgs['TE']:.4f}")
+        
+        log_training.write(f"\nEpoch {i+1}\n")
+        log_training.write(str(avgs) + "\n")
 
-        # Additional logging for component losses
-        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
-        log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
-        log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
-
+        # Save Checkpoint
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
                 'state_dict': model.state_dict(),
@@ -199,76 +167,43 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scheduler': lr_scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
-        # if (i + 1) > config.val_epochs_ts:
-        #     torch.save(model.state_dict(), os.path.join(config.save_path, f"epoch_{i}.pt"))
-        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm",
-                   "AUC"]
+
+        # Model Evaluation
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")
-            loss_avg, val_result = evaluate(model, val_dataset, config)
-            result = ""
+            val_loss_avg, val_result = evaluate(model, val_dataset, config)
+            
+            result_str = ""
+            key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
             for key in val_result:
                 if key in key_set:
-                    result = result + key + "  " + str(round(val_result[key], 4)) + "| "
-            log_training.write('\n')
-            log_training.write(result)
-            print("Loss average on val dataset: {}".format(loss_avg))
-            log_training.write('\n')
-            log_training.write("Loss average on val dataset: {}\n".format(loss_avg))
+                    result_str += f"{key} {round(val_result[key], 4)}| "
+            
+            print(f"Val: {result_str}")
+            log_training.write(f"Val Results: {result_str}\n")
+            
+            # Save Best Model
+            current_metric = val_result[config.best_model_metric] if config.best_model_metric != "best_loss" else -val_loss_avg.item()
             if config.best_model_metric == "best_loss":
-                if loss_avg.cpu().float() < best_loss:
-                    print('find best!')
-                    log_training.write('find best!')
-                    best_loss = loss_avg.cpu().float()
-                    print("Evaluating test dataset:")
-                    loss_avg, val_result = evaluate(model, test_dataset, config)
-                    torch.save(model.state_dict(), os.path.join(
-                        config.save_path, f"best.pt"
-                    ))
-                    result = ""
-                    for key in val_result:
-                        if key in key_set:
-                            result = result + key + "  " + str(round(val_result[key], 4)) + "| "
-                    log_training.write('\n')
-                    log_training.write(result)
-                    print("Loss average on test dataset: {}".format(loss_avg))
-                    log_training.write('\n')
-                    log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
+                is_best = val_loss_avg < best_loss
+                if is_best:
+                    best_loss = val_loss_avg
             else:
-                if val_result[config.best_model_metric] > best_metric:
-                    best_metric = val_result[config.best_model_metric]
-                    log_training.write('\n')
-                    print('find best!')
-                    log_training.write('find best!')
-                    loss_avg, val_result = evaluate(model, test_dataset, config)
-                    torch.save(model.state_dict(), os.path.join(
-                        config.save_path, f"best.pt"
-                    ))
-                    result = ""
-                    for key in val_result:
-                        if key in key_set:
-                            result = result + key + "  " + str(round(val_result[key], 4)) + "| "
-                    log_training.write('\n')
-                    log_training.write(result)
-                    print("Loss average on test dataset: {}".format(loss_avg))
-                    log_training.write('\n')
-                    log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
-        log_training.write('\n')
+                is_best = current_metric > best_metric
+                if is_best:
+                    best_metric = current_metric
+            
+            if is_best:
+                print('Found best model!')
+                torch.save(model.state_dict(), os.path.join(config.save_path, "best.pt"))
+                print("Evaluating test dataset:")
+                _, test_result = evaluate(model, test_dataset, config)
+                # ... log test result ...
+
         log_training.flush()
-        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm",
-                   "AUC"]
-        if i + 1 == config.epochs:
-            print("Evaluating test dataset on Closed World")
-            model.load_state_dict(torch.load(os.path.join(
-                config.save_path, "best.pt"
-            )))
-            loss_avg, val_result = evaluate(model, test_dataset, config)
-            result = ""
-            for key in val_result:
-                if key in key_set:
-                    result = result + key + "  " + str(round(val_result[key], 4)) + "| "
-            log_training.write('\n')
-            log_training.write(result)
-            print("Final Loss average on test dataset: {}".format(loss_avg))
-            log_training.write('\n')
-            log_training.write("Final Loss average on test dataset: {}\n".format(loss_avg))
+
+    # Final Evaluation
+    if i + 1 == config.epochs:
+        print("Final Evaluation")
+        model.load_state_dict(torch.load(os.path.join(config.save_path, "best.pt")))
+        evaluate(model, test_dataset, config)
