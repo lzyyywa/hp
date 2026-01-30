@@ -71,7 +71,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # [STEP 1] Initialize Hierarchy Helper
     # =========================================================================
     print("[Train] Initializing Hierarchy Helper...")
-    helper = HierarchyHelper(train_dataset, root_dir='codes/dataset')
+    helper = HierarchyHelper(train_dataset, root_dir='dataset')
     
     # Inject text information into the model
     coarse_verbs, coarse_objs = helper.get_coarse_info()
