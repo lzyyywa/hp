@@ -132,6 +132,9 @@ class VideoEncoder(nn.Module):
 # ==================================================================================
 # 2. CustomCLIP (Hyperbolic Core Logic)
 # ==================================================================================
+# -------------------------------------------------------------
+# 请将下面的 CustomCLIP 类替换掉你文件中的 CustomCLIP 类
+# -------------------------------------------------------------
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
@@ -162,36 +165,99 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # [NEW] Placeholders for Hierarchy
-        self.coarse_verb_tokens = None
-        self.coarse_obj_tokens = None
-        self.comp_tokens = None
+        # [NEW] Caching Mechanism
+        self.cached_hierarchy = {} # Stores pre-computed hyperbolic embeddings
         
         # Save references
         self.clip_tokenize = clip.tokenize
         self.token_embedding = clip_model.token_embedding
         self.positional_embedding = clip_model.positional_embedding
+        
+        # Store device reference (will be updated in forward or explicit call)
+        self.model_device = next(self.parameters()).device
 
-    def set_hierarchy_prompts(self, coarse_verbs, coarse_objs, pairs):
-        """Set hierarchical text prompts"""
-        print(f"[CustomCLIP] Setting up hierarchy prompts...")
-        self.coarse_verb_tokens = self.clip_tokenize([f"a photo of {v} something" for v in coarse_verbs])
-        self.coarse_obj_tokens = self.clip_tokenize([f"a photo of something {o}" for o in coarse_objs])
-        pair_texts = [f"a photo of {v} {o}" for v, o in pairs]
-        self.comp_tokens = self.clip_tokenize(pair_texts)
-        print(f"[CustomCLIP] Hierarchy ready: {len(coarse_verbs)} coarse verbs, {len(coarse_objs)} coarse objects, {len(pairs)} composition pairs.")
-
-    def _encode_plain_text(self, tokenized_prompts, device):
-        """Helper function: Encode normal text with length 77"""
+    def _encode_plain_text(self, tokenized_prompts):
+        """Helper to encode plain text (no grad needed usually)"""
+        # Ensure input is on correct device
+        tokenized_prompts = tokenized_prompts.to(self.model_device)
+        
         # 1. Token Embeddings
         x = self.token_embedding(tokenized_prompts).type(self.text_encoder.dtype)
         # 2. Positional Embeddings
         x = x + self.positional_embedding.type(self.text_encoder.dtype)
-        # 3. Transformer (Attention Mask will be handled dynamically inside TextEncoder)
+        # 3. Transformer
         return self.text_encoder(x, tokenized_prompts)
+
+    def set_hierarchy_prompts(self, coarse_verbs, coarse_objs, pairs):
+        """
+        Setup and PRE-COMPUTE hierarchy embeddings to save memory/time.
+        """
+        print(f"[CustomCLIP] Setting up and caching hierarchy prompts...")
+        
+        # Ensure model is on GPU before encoding
+        # If this is called before .cuda(), we might need to handle it.
+        # Typically train_models.py calls .cuda() then this.
+        # But DataParallel wraps it.
+        # Safest way: just tokenize here, compute in first forward or explicit call.
+        
+        self.coarse_verb_tokens = self.clip_tokenize([f"a photo of {v} something" for v in coarse_verbs])
+        self.coarse_obj_tokens = self.clip_tokenize([f"a photo of something {o}" for o in coarse_objs])
+        
+        # Batching for large pairs list (to avoid OOM during pre-computation)
+        pair_texts = [f"a photo of {v} {o}" for v, o in pairs]
+        self.comp_tokens = self.clip_tokenize(pair_texts)
+        
+        print(f"[CustomCLIP] Tokenized. Ready to cache on device.")
+
+    def _ensure_hierarchy_cached(self, device):
+        """
+        Compute and cache embeddings if not already done.
+        This is called inside forward() to ensure device is correct.
+        """
+        if "comp_hyp" in self.cached_hierarchy:
+            return # Already cached
+
+        print(f"[CustomCLIP] Computing hierarchy cache on {device}...")
+        self.model_device = device
+        
+        # We use no_grad because these are fixed text targets (not learned prompts)
+        with torch.no_grad():
+            # 1. Coarse Verbs
+            cv_emb = self._encode_plain_text(self.coarse_verb_tokens)
+            cv_hyp = LorentzMath.exp_map_0(F.normalize(cv_emb, dim=-1))
+            self.cached_hierarchy["coarse_verb_hyp"] = cv_hyp
+
+            # 2. Coarse Objs
+            co_emb = self._encode_plain_text(self.coarse_obj_tokens)
+            co_hyp = LorentzMath.exp_map_0(F.normalize(co_emb, dim=-1))
+            self.cached_hierarchy["coarse_obj_hyp"] = co_hyp
+
+            # 3. Compositions (Batch processing to avoid OOM)
+            # Split comp_tokens into chunks
+            batch_size = 500 # Adjust if still OOM
+            comp_embs = []
+            total = self.comp_tokens.shape[0]
+            
+            for i in range(0, total, batch_size):
+                batch_tokens = self.comp_tokens[i : i + batch_size]
+                emb = self._encode_plain_text(batch_tokens)
+                comp_embs.append(emb.cpu()) # Store on CPU first to save GPU mem
+            
+            comp_emb_all = torch.cat(comp_embs, dim=0).to(device) # Move back to GPU or keep CPU?
+            # Ideally keep on GPU for Loss calculation, but if too big, Loss needs adjustment.
+            # Assuming 24GB GPU, storing ~10k vectors (10k * 512 * 4 bytes = 20MB) is trivial.
+            # The OOM was caused by the Intermediate Activations during Backward/Forward of the Transformer.
+            
+            self.cached_hierarchy["comp_hyp"] = LorentzMath.exp_map_0(F.normalize(comp_emb_all, dim=-1))
+            
+        print(f"[CustomCLIP] Cache finished.")
 
     def forward(self, video, pairs=None):
         device = video.device
+        
+        # Ensure cache is ready (Lazy loading)
+        if self.coarse_verb_tokens is not None and "comp_hyp" not in self.cached_hierarchy:
+            self._ensure_hierarchy_cached(device)
 
         # --- 1. Text Encoding (Fine-grained, Length 10) ---
         verb_prompts = self.verb_prompt_learner()
@@ -211,26 +277,14 @@ class CustomCLIP(nn.Module):
         # --- 3. Hyperbolic Transformation ---
         o_feat_hyp = LorentzMath.exp_map_0(F.normalize(o_feat, dim=1))
         v_feat_hyp = LorentzMath.exp_map_0(F.normalize(v_feat, dim=1))
+        
         verb_text_hyp = LorentzMath.exp_map_0(F.normalize(verb_text_features, dim=-1))
         obj_text_hyp = LorentzMath.exp_map_0(F.normalize(obj_text_features, dim=-1))
 
-        # --- 4. Hierarchy Encoding (Coarse/Composition, Length 77) ---
-        coarse_verb_hyp = None
-        coarse_obj_hyp = None
-        comp_hyp = None
-
-        if self.coarse_verb_tokens is not None:
-            cv_tokens = self.coarse_verb_tokens.to(device)
-            co_tokens = self.coarse_obj_tokens.to(device)
-            c_tokens = self.comp_tokens.to(device)
-
-            cv_emb = self._encode_plain_text(cv_tokens, device)
-            co_emb = self._encode_plain_text(co_tokens, device)
-            c_emb = self._encode_plain_text(c_tokens, device)
-            
-            coarse_verb_hyp = LorentzMath.exp_map_0(F.normalize(cv_emb, dim=-1))
-            coarse_obj_hyp = LorentzMath.exp_map_0(F.normalize(co_emb, dim=-1))
-            comp_hyp = LorentzMath.exp_map_0(F.normalize(c_emb, dim=-1))
+        # --- 4. Retrieve Cached Hierarchy Features ---
+        coarse_verb_hyp = self.cached_hierarchy.get("coarse_verb_hyp")
+        coarse_obj_hyp = self.cached_hierarchy.get("coarse_obj_hyp")
+        comp_hyp = self.cached_hierarchy.get("comp_hyp")
 
         # --- 5. Logits (Distance) ---
         dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0))
@@ -257,6 +311,7 @@ class CustomCLIP(nn.Module):
                 return verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
             else:
                 return verb_logits, obj_logits
+
 
 # ... (load_clip_to_cpu and build_model remain unchanged)
 def load_clip_to_cpu(cfg):
