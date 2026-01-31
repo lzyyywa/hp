@@ -50,13 +50,14 @@ class EntailmentConeLoss(nn.Module):
     Enforces u < v (v is inside the cone of u).
     u: Parent (Abstract)
     v: Child (Specific)
+    
+    FEATURE: Uses DYNAMIC APERTURE based on parent norm.
     """
-    def __init__(self, aperture=0.1, margin=0.01):
+    def __init__(self, min_radius=0.1, margin=0.01, aperture_scale=1.2):
         super(EntailmentConeLoss, self).__init__()
-        # In HyCoCLIP, aperture (K) can be learnable, here we keep it fixed or passed in.
-        # Ideally, aperture should be small (narrow cone).
-        self.aperture_val = aperture 
+        self.min_radius = min_radius
         self.margin = margin
+        self.aperture_scale = aperture_scale # Scales the calculated dynamic aperture
         self.c = 1.0 # Default curvature
 
     def forward(self, child_emb, parent_emb):
@@ -71,17 +72,19 @@ class EntailmentConeLoss(nn.Module):
         # This uses the hyperbolic law of cosines (from upgraded LorentzMath)
         angle = LorentzMath.oxy_angle(parent_emb, child_emb, c=self.c)
         
-        # 2. Calculate the aperture (opening angle) of the Parent's cone
-        # In HyCoCLIP, aperture depends on the norm (distance from origin).
-        # Further from origin -> Smaller aperture (more specific).
-        # Closer to origin -> Larger aperture (more abstract).
-        half_aperture = LorentzMath.half_aperture(parent_emb, c=self.c, min_radius=0.1)
+        # 2. [NEW] Calculate DYNAMIC aperture based on Parent's norm
+        # Closer to origin (abstract) -> Wider cone (easier to contain children)
+        # Further from origin (specific) -> Narrower cone
+        dynamic_aperture = LorentzMath.half_aperture(parent_emb, c=self.c, min_radius=self.min_radius)
         
-        # 3. Cone Constraint Loss
-        # We want: angle < half_aperture
-        # Loss = ReLU(angle - half_aperture)
-        # We add a small margin for robustness
-        cone_loss = F.relu(angle - half_aperture + self.margin)
+        # 3. Apply scaling factor (HyCoCLIP practice)
+        # Scale > 1.0 widens the cone slightly to help convergence
+        target_aperture = self.aperture_scale * dynamic_aperture
+        
+        # 4. Cone Constraint Loss
+        # We want: angle < target_aperture
+        # Loss = ReLU(angle - target_aperture)
+        cone_loss = F.relu(angle - target_aperture + self.margin)
         
         return cone_loss.mean()
 
@@ -92,12 +95,14 @@ class H2EMTotalLoss(nn.Module):
     def __init__(self, temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5):
         super(H2EMTotalLoss, self).__init__()
         self.beta1 = beta1 # DA
-        self.beta2 = beta2 # TE
+        self.beta2 = beta2 # TE (Can be kept small now because aperture is dynamic)
         self.beta3 = beta3 # Prim
         
         self.loss_cls = HyperbolicPrototypicalLoss(temperature=temperature)
-        # Using a slightly larger aperture default for stability
-        self.loss_cone = EntailmentConeLoss(aperture=0.1, margin=0.01)
+        
+        # [UPDATED] Initialize with dynamic aperture parameters
+        # aperture_scale=1.2 gives the model 20% more room than strict geometry, helping early convergence
+        self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.2)
 
     def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
         # Unpack
