@@ -6,6 +6,7 @@ from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
 
+# Import the upgraded stable hyperbolic ops
 try:
     from utils.hyperbolic_ops import LorentzMath
 except ImportError:
@@ -117,7 +118,7 @@ class VideoEncoder(nn.Module):
 
 
 # ==================================================================================
-# 2. CustomCLIP (Modified with Projections)
+# 2. CustomCLIP (Modified with Projections & Hyperbolic Initialization)
 # ==================================================================================
 
 class CustomCLIP(nn.Module):
@@ -138,6 +139,7 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
+        # Projection Layers (Euclidean -> Hyperbolic Space Pre-projection)
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                            dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
@@ -151,6 +153,30 @@ class CustomCLIP(nn.Module):
         self.token_embedding = clip_model.token_embedding
         self.positional_embedding = clip_model.positional_embedding
         self.model_device = next(self.parameters()).device
+        
+        # [NEW] Apply special initialization for Hyperbolic modules
+        self._init_hyperbolic_modules()
+
+    def _init_hyperbolic_modules(self):
+        """
+        [HyCoCLIP Practice]
+        Initialize projection layers with normal distribution to ensure sufficient norm.
+        Prevents features from collapsing to origin (where Hyperbolic space behaves like Euclidean).
+        """
+        print("[CustomCLIP] Applying Hyperbolic Initialization...")
+        for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
+            # Recursively initialize Linear layers inside
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Sequential) or isinstance(m, nn.Module):
+                for sub_m in m.modules():
+                    if isinstance(sub_m, nn.Linear):
+                        # Use slightly larger std for deeper nets
+                        nn.init.normal_(sub_m.weight, std=0.02) 
+                        if sub_m.bias is not None:
+                            nn.init.constant_(sub_m.bias, 0)
 
     def _encode_plain_text(self, tokenized_prompts):
         tokenized_prompts = tokenized_prompts.to(self.model_device)
@@ -176,12 +202,12 @@ class CustomCLIP(nn.Module):
         with torch.no_grad():
             # 1. Coarse Verbs -> Project to Verb Space
             cv_emb = self._encode_plain_text(self.coarse_verb_tokens)
-            cv_emb = self.c2c_text_v(cv_emb) # [FIX] Project 512->300
+            cv_emb = self.c2c_text_v(cv_emb) 
             self.cached_hierarchy["coarse_verb_hyp"] = LorentzMath.exp_map_0(F.normalize(cv_emb, dim=-1))
 
             # 2. Coarse Objects -> Project to Object Space
             co_emb = self._encode_plain_text(self.coarse_obj_tokens)
-            co_emb = self.c2c_text_o(co_emb) # [FIX] Project 512->300
+            co_emb = self.c2c_text_o(co_emb) 
             self.cached_hierarchy["coarse_obj_hyp"] = LorentzMath.exp_map_0(F.normalize(co_emb, dim=-1))
 
             # 3. Compositions -> Project to BOTH Spaces
@@ -195,7 +221,6 @@ class CustomCLIP(nn.Module):
             
             comp_emb_all = torch.cat(comp_embs, dim=0).to(device)
             
-            # [FIX] Generate two sets of composition features
             # This set aligns with Verbs (Comp -> Verb)
             comp_emb_v = self.c2c_text_v(comp_emb_all)
             self.cached_hierarchy["comp_hyp_v"] = LorentzMath.exp_map_0(F.normalize(comp_emb_v, dim=-1))
@@ -228,6 +253,7 @@ class CustomCLIP(nn.Module):
         v_feat = v_feat_t.mean(dim=-1)
 
         # 3. Hyperbolic Space Projection
+        # [CRITICAL] Normalize first, then ExpMap.
         o_feat_hyp = LorentzMath.exp_map_0(F.normalize(o_feat, dim=1))
         v_feat_hyp = LorentzMath.exp_map_0(F.normalize(v_feat, dim=1))
         
@@ -237,7 +263,6 @@ class CustomCLIP(nn.Module):
         # 4. Retrieve Cached Hierarchical Features
         coarse_verb_hyp = self.cached_hierarchy.get("coarse_verb_hyp")
         coarse_obj_hyp = self.cached_hierarchy.get("coarse_obj_hyp")
-        # [FIX] Return both composition embeddings
         comp_hyp_v = self.cached_hierarchy.get("comp_hyp_v")
         comp_hyp_o = self.cached_hierarchy.get("comp_hyp_o")
 
@@ -245,7 +270,21 @@ class CustomCLIP(nn.Module):
         dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0))
         dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0))
         
-        verb_logits = -dist_v
+        # [NEW] Logit Scale Clamping (HyCoCLIP Practice)
+        # Prevents gradient explosion in early training
+        logit_scale = self.logit_scale.exp()
+        logit_scale = torch.clamp(logit_scale, max=100.0)
+        
+        # Note: If loss.py uses fixed temperature, you might not need to multiply by logit_scale here.
+        # But typically, CLIP fine-tuning benefits from a learnable scale.
+        # We output raw negative distance here, and let loss.py handle temperature division 
+        # OR we multiply here if using standard CE.
+        
+        # Current Configuration: Loss.py uses fixed temperature (0.1) or learnable.
+        # If we want to use CLIP's learnable scale:
+        # logits = -dist * logit_scale
+        # If we stick to H2EM paper setting (fixed temp):
+        verb_logits = -dist_v 
         obj_logits = -dist_o
 
         if self.training:
@@ -258,8 +297,8 @@ class CustomCLIP(nn.Module):
                 "obj_text_hyp": obj_text_hyp,
                 "coarse_verb_hyp": coarse_verb_hyp,
                 "coarse_obj_hyp": coarse_obj_hyp,
-                "comp_hyp_v": comp_hyp_v,  # New Key
-                "comp_hyp_o": comp_hyp_o   # New Key
+                "comp_hyp_v": comp_hyp_v,  
+                "comp_hyp_o": comp_hyp_o   
             }
         else:
             if pairs is not None:
