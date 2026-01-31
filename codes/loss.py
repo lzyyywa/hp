@@ -28,28 +28,31 @@ def loss_calu(predict, target, config):
 class HyperbolicPrototypicalLoss(nn.Module):
     """
     Discriminative Loss in Hyperbolic Space.
-    Uses negative hyperbolic distance as logits.
+    
+    [FIX] Now accepts dynamic logit_scale instead of fixed temperature.
     """
-    def __init__(self, temperature=0.1, c=1.0):
+    def __init__(self, c=1.0):
         super(HyperbolicPrototypicalLoss, self).__init__()
-        self.temperature = temperature
         self.c = c
         self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, query_emb, prototype_emb, targets):
+    def forward(self, query_emb, prototype_emb, targets, logit_scale=100.0):
         q = query_emb.unsqueeze(1)
         p = prototype_emb.unsqueeze(0)
-        # Uses the stable distance from upgraded LorentzMath
+        
+        # Calculate Distance
         dists = LorentzMath.hyp_distance(q, p, c=self.c)
-        logits = -dists / self.temperature
+        
+        # Apply Learnable Scale (equivalent to 1/temperature)
+        # Logits = -distance * scale
+        logits = -dists * logit_scale
+        
         return self.loss_fn(logits, targets)
 
 class EntailmentConeLoss(nn.Module):
     """
     [UPGRADED] Hierarchical Entailment Cone Loss (HyCoCLIP Style).
     Enforces u < v (v is inside the cone of u).
-    u: Parent (Abstract)
-    v: Child (Specific)
     
     FEATURE: Uses DYNAMIC APERTURE based on parent norm.
     """
@@ -57,33 +60,21 @@ class EntailmentConeLoss(nn.Module):
         super(EntailmentConeLoss, self).__init__()
         self.min_radius = min_radius
         self.margin = margin
-        self.aperture_scale = aperture_scale # Scales the calculated dynamic aperture
-        self.c = 1.0 # Default curvature
+        self.aperture_scale = aperture_scale 
+        self.c = 1.0 
 
     def forward(self, child_emb, parent_emb):
-        """
-        Args:
-            child_emb: [B, d+1] (Specific concept)
-            parent_emb: [B, d+1] (Abstract concept)
-        We want: Child to be INSIDE the cone of Parent.
-        """
-        
-        # 1. Calculate actual hyperbolic angle between Parent and Child
-        # This uses the hyperbolic law of cosines (from upgraded LorentzMath)
+        # 1. Calculate actual hyperbolic angle
         angle = LorentzMath.oxy_angle(parent_emb, child_emb, c=self.c)
         
-        # 2. [NEW] Calculate DYNAMIC aperture based on Parent's norm
-        # Closer to origin (abstract) -> Wider cone (easier to contain children)
-        # Further from origin (specific) -> Narrower cone
+        # 2. Calculate DYNAMIC aperture based on Parent's norm
+        # No normalization in model means norms now vary properly!
         dynamic_aperture = LorentzMath.half_aperture(parent_emb, c=self.c, min_radius=self.min_radius)
         
-        # 3. Apply scaling factor (HyCoCLIP practice)
-        # Scale > 1.0 widens the cone slightly to help convergence
+        # 3. Apply scaling factor 
         target_aperture = self.aperture_scale * dynamic_aperture
         
         # 4. Cone Constraint Loss
-        # We want: angle < target_aperture
-        # Loss = ReLU(angle - target_aperture)
         cone_loss = F.relu(angle - target_aperture + self.margin)
         
         return cone_loss.mean()
@@ -92,20 +83,20 @@ class H2EMTotalLoss(nn.Module):
     """
     H2EM Paper Eq. (16) Wrapper.
     """
-    def __init__(self, temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5):
+    def __init__(self, temperature=None, beta1=1.0, beta2=0.1, beta3=0.5):
         super(H2EMTotalLoss, self).__init__()
         self.beta1 = beta1 # DA
-        self.beta2 = beta2 # TE (Can be kept small now because aperture is dynamic)
+        self.beta2 = beta2 # TE
         self.beta3 = beta3 # Prim
         
-        self.loss_cls = HyperbolicPrototypicalLoss(temperature=temperature)
+        # Note: temperature arg is deprecated here, we use dynamic logit_scale
+        self.loss_cls = HyperbolicPrototypicalLoss()
         
-        # [UPDATED] Initialize with dynamic aperture parameters
-        # aperture_scale=1.2 gives the model 20% more room than strict geometry, helping early convergence
+        # Dynamic aperture parameters
         self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.2)
 
     def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
-        # Unpack
+        # Unpack Features
         v_feat_hyp = out['v_feat_hyp']
         o_feat_hyp = out['o_feat_hyp']
         verb_text_hyp = out['verb_text_hyp']
@@ -116,27 +107,29 @@ class H2EMTotalLoss(nn.Module):
         comp_hyp_v = out['comp_hyp_v'] 
         comp_hyp_o = out['comp_hyp_o'] 
         
+        # Unpack Raw Logits (Unscaled Negative Distances)
         verb_logits = out['verb_logits']
         obj_logits = out['obj_logits']
+        
+        # [NEW] Get Learnable Scale
+        logit_scale = out['logit_scale']
 
         # A. Primitive Auxiliary (L_s + L_o)
-        L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb)
-        L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj)
+        # Pass logit_scale to the loss function
+        L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb, logit_scale)
+        L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj, logit_scale)
         L_prim = L_s + L_o
 
         # B. Discriminative Alignment (L_DA)
+        # Apply scale to the sum of raw logits
         pair_logits = verb_logits[:, p2v_map] + obj_logits[:, p2o_map]
-        L_DA = F.cross_entropy(pair_logits / self.loss_cls.temperature, batch_target)
+        L_DA = F.cross_entropy(pair_logits * logit_scale, batch_target)
 
         # C. Taxonomic Entailment (L_TE)
         # Cone directions: Parent contains Child
-        # 1. Coarse Verb contains Verb
         loss_h1 = self.loss_cone(child_emb=verb_text_hyp, parent_emb=coarse_verb_hyp[v2cv_map])
-        # 2. Coarse Object contains Object
         loss_h2 = self.loss_cone(child_emb=obj_text_hyp, parent_emb=coarse_obj_hyp[o2co_map])
-        # 3. Verb contains Composition
         loss_h3 = self.loss_cone(child_emb=comp_hyp_v, parent_emb=verb_text_hyp[p2v_map])
-        # 4. Object contains Composition
         loss_h4 = self.loss_cone(child_emb=comp_hyp_o, parent_emb=obj_text_hyp[p2o_map])
         
         L_TE = loss_h1 + loss_h2 + loss_h3 + loss_h4
