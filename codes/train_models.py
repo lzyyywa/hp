@@ -8,12 +8,12 @@ from torch.utils.data.dataloader import DataLoader
 import torch.nn.functional as F
 
 import test as test
-# [NEW] Import Helper and the Encapsulated Loss
+# [IMPORT] Import the upgraded Loss and Helper
 from loss import H2EMTotalLoss
 from utils.hierarchy_helper import HierarchyHelper
 
 def cal_conditional(attr2idx, obj2idx, set_name, daset):
-    # (Keep the original logic unchanged)
+    # (Original logic kept unchanged)
     def load_split(path):
         with open(path, 'r') as f:
             loaded_data = json.load(f)
@@ -41,6 +41,7 @@ def cal_conditional(attr2idx, obj2idx, set_name, daset):
     return v_o_on_v, v_o_on_o
 
 def evaluate(model, dataset, config):
+    # (Original logic kept unchanged)
     model.eval()
     evaluator = test.Evaluator(dataset, model=None)
     all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = test.predict_logits(
@@ -71,7 +72,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # [STEP 1] Initialize Hierarchy Helper
     # =========================================================================
     print("[Train] Initializing Hierarchy Helper...")
-    helper = HierarchyHelper(train_dataset, root_dir='dataset')
+    helper = HierarchyHelper(train_dataset, root_dir='codes/dataset') # Ensure correct path
     
     # Inject text information into the model
     coarse_verbs, coarse_objs = helper.get_coarse_info()
@@ -89,8 +90,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # =========================================================================
     # [STEP 2] Instantiate the Encapsulated Loss
     # =========================================================================
-    # Use the H2EMTotalLoss we defined in loss.py
-    # Coefficients: Beta1(DA)=1.0, Beta2(TE)=0.1, Beta3(Prim)=0.5
+    # Beta2=0.1 is acceptable now because we use DYNAMIC APERTURE in loss.py
     criterion = H2EMTotalLoss(temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5).cuda()
     
     train_dataloader = DataLoader(
@@ -121,22 +121,38 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
 
+            # [CRITICAL FIX] AMP Scope Management
+            # We run the Forward pass in AMP (Mixed Precision) for speed
             with torch.cuda.amp.autocast(enabled=True):
-                # 1. Forward propagation
                 out = model(batch_img)
-                
-                # 2. Calculate loss (call the encapsulated logic in loss.py)
-                # Pass all required mapping tables: p2v, p2o (for DA and Comp constraints), v2cv, o2co (for Prim constraints)
-                loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
-                                          p2v, p2o, v2cv, o2co)
-                
-                loss = loss / config.gradient_accumulation_steps
+            
+            # [CRITICAL FIX] Force Loss Calculation in Float32
+            # Hyperbolic operations (acosh, exp_map) are unstable in float16.
+            # We exit the autocast context and cast outputs to float32.
+            
+            # Cast all hyperbolic features in 'out' dict to float32
+            out_f32 = {}
+            for k, v in out.items():
+                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                    out_f32[k] = v.float() 
+                else:
+                    out_f32[k] = v
+            
+            # Calculate Loss in FP32
+            loss, loss_dict = criterion(out_f32, batch_verb, batch_obj, batch_target, 
+                                      p2v, p2o, v2cv, o2co)
+            
+            loss = loss / config.gradient_accumulation_steps
 
             # 3. Backward propagation
+            # Scaler handles the mixed precision backward pass
             scaler.scale(loss).backward()
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
                 scaler.unscale_(optimizer)
+                # Gradient Clipping is good practice for Hyperbolic Networks
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -202,7 +218,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 torch.save(model.state_dict(), os.path.join(config.save_path, "best.pt"))
                 print("Evaluating test dataset:")
                 _, test_result = evaluate(model, test_dataset, config)
-                # ... log test result ...
+                # (Optional) Log test result for best model if needed
 
         log_training.flush()
 
