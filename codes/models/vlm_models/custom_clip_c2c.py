@@ -25,7 +25,6 @@ def clip_norm(x, max_norm=15.0):
     """
     norm = x.norm(p=2, dim=-1, keepdim=True)
     # If norm > max_norm, scale it down. Otherwise, keep it as is.
-    # Adding 1e-6 to avoid division by zero.
     target_norm = torch.clamp(norm, max=max_norm)
     return x * (target_norm / (norm + 1e-6))
 
@@ -147,6 +146,10 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
         
+        # [NEW] Learnable Curvature Parameter
+        # Initialized to 1.0. Wrapped in nn.Parameter to be optimized.
+        self.c_param = nn.Parameter(torch.tensor(1.0))
+
         # [OPTIMIZATION] Use CLIP's learnable logit scale
         self.logit_scale = clip_model.logit_scale
 
@@ -187,23 +190,18 @@ class CustomCLIP(nn.Module):
         for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
             if isinstance(m, nn.Module):
                 for sub_m in m.modules():
-                    # Apply Orthogonal Initialization to Linear layers
                     if isinstance(sub_m, nn.Linear):
-                        # gain=1.0 means keeping the vector norm approximately unchanged
                         nn.init.orthogonal_(sub_m.weight, gain=1.0)
                         if sub_m.bias is not None:
                             nn.init.constant_(sub_m.bias, 0.0)
-                    
-                    # Apply Orthogonal Initialization to Conv1d layers (used in your MLP_ST)
                     elif isinstance(sub_m, nn.Conv1d):
                         nn.init.orthogonal_(sub_m.weight, gain=1.0)
                         if sub_m.bias is not None:
                             nn.init.constant_(sub_m.bias, 0.0)
-                    
-                    # Initialize LayerNorm as Identity transformation
                     elif isinstance(sub_m, nn.LayerNorm):
                         nn.init.constant_(sub_m.bias, 0.0)
-                        nn.init.constant_(sub_m.weight, 1.0)    
+                        nn.init.constant_(sub_m.weight, 1.0)     
+
     def _encode_plain_text(self, tokenized_prompts):
         tokenized_prompts = tokenized_prompts.to(self.model_device)
         x = self.token_embedding(tokenized_prompts).type(self.text_encoder.dtype)
@@ -219,26 +217,28 @@ class CustomCLIP(nn.Module):
         print(f"[CustomCLIP] Ready to cache.")
 
     def _ensure_hierarchy_cached(self, device):
-        if "comp_hyp_v" in self.cached_hierarchy:
+        """
+        [CACHING STRATEGY UPDATE]
+        We now cache the EUCLIDEAN CLIP embeddings (Static), not the Hyperbolic ones.
+        This allows us to re-project them using the updated projection layers 
+        and the updated curvature 'c' in every forward pass.
+        """
+        if "coarse_verb_clip" in self.cached_hierarchy:
             return 
 
-        print(f"[CustomCLIP] Computing and projecting hierarchy cache on {device}...")
+        print(f"[CustomCLIP] Computing and caching EUCLIDEAN hierarchy features on {device}...")
         self.model_device = device
         
         with torch.no_grad():
-            # [FIXED] Apply clip_norm instead of F.normalize
-            
-            # 1. Coarse Verbs
+            # 1. Coarse Verbs (Store CLIP output)
             cv_emb = self._encode_plain_text(self.coarse_verb_tokens)
-            cv_emb = self.c2c_text_v(cv_emb) 
-            self.cached_hierarchy["coarse_verb_hyp"] = LorentzMath.exp_map_0(clip_norm(cv_emb))
+            self.cached_hierarchy["coarse_verb_clip"] = cv_emb.detach()
 
-            # 2. Coarse Objects
+            # 2. Coarse Objects (Store CLIP output)
             co_emb = self._encode_plain_text(self.coarse_obj_tokens)
-            co_emb = self.c2c_text_o(co_emb) 
-            self.cached_hierarchy["coarse_obj_hyp"] = LorentzMath.exp_map_0(clip_norm(co_emb))
+            self.cached_hierarchy["coarse_obj_clip"] = co_emb.detach()
 
-            # 3. Compositions
+            # 3. Compositions (Store CLIP output)
             batch_size = 500
             comp_embs = []
             total = self.comp_tokens.shape[0]
@@ -248,59 +248,75 @@ class CustomCLIP(nn.Module):
                 comp_embs.append(emb.cpu())
             
             comp_emb_all = torch.cat(comp_embs, dim=0).to(device)
-            
-            # Comp -> Verb Space
-            comp_emb_v = self.c2c_text_v(comp_emb_all)
-            self.cached_hierarchy["comp_hyp_v"] = LorentzMath.exp_map_0(clip_norm(comp_emb_v))
-            
-            # Comp -> Object Space
-            comp_emb_o = self.c2c_text_o(comp_emb_all)
-            self.cached_hierarchy["comp_hyp_o"] = LorentzMath.exp_map_0(clip_norm(comp_emb_o))
+            self.cached_hierarchy["comp_clip"] = comp_emb_all.detach()
             
         print(f"[CustomCLIP] Cache finished.")
 
     def forward(self, video, pairs=None):
         device = video.device
         
-        if self.coarse_verb_tokens is not None and "comp_hyp_v" not in self.cached_hierarchy:
+        # [NEW] Dynamic Curvature Calculation
+        # Ensure c > 0 using softplus and minimum bound
+        current_c = F.softplus(self.c_param) + 1e-5
+        
+        if self.coarse_verb_tokens is not None and "coarse_verb_clip" not in self.cached_hierarchy:
             self._ensure_hierarchy_cached(device)
 
-        # 1. Fine-grained Feature Extraction (Euclidean)
+        # ----------------------------------------------------------------------
+        # 1. Fine-grained Feature Extraction (Euclidean) -> Projection -> Hyperbolic
+        # ----------------------------------------------------------------------
+        
+        # Verbs
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         verb_text_features = self.c2c_text_v(verb_text_features)
+        verb_text_hyp = LorentzMath.exp_map_0(clip_norm(verb_text_features), c=current_c)
 
+        # Objects
         obj_prompts = self.obj_prompt_learner()
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
         obj_text_features = self.c2c_text_o(obj_text_features)
+        obj_text_hyp = LorentzMath.exp_map_0(clip_norm(obj_text_features), c=current_c)
 
+        # Video
         video_features = self.video_encoder(video)
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # 2. Hyperbolic Space Projection [CRITICAL FIX]
-        # REMOVED: F.normalize (which kills hierarchy)
-        # ADDED: clip_norm (prevent explosion)
-        
-        o_feat_hyp = LorentzMath.exp_map_0(clip_norm(o_feat))
-        v_feat_hyp = LorentzMath.exp_map_0(clip_norm(v_feat))
-        
-        verb_text_hyp = LorentzMath.exp_map_0(clip_norm(verb_text_features))
-        obj_text_hyp = LorentzMath.exp_map_0(clip_norm(obj_text_features))
+        # Project Video to Hyperbolic (using current_c)
+        o_feat_hyp = LorentzMath.exp_map_0(clip_norm(o_feat), c=current_c)
+        v_feat_hyp = LorentzMath.exp_map_0(clip_norm(v_feat), c=current_c)
 
-        # 3. Retrieve Cached Hierarchical Features
-        coarse_verb_hyp = self.cached_hierarchy.get("coarse_verb_hyp")
-        coarse_obj_hyp = self.cached_hierarchy.get("coarse_obj_hyp")
-        comp_hyp_v = self.cached_hierarchy.get("comp_hyp_v")
-        comp_hyp_o = self.cached_hierarchy.get("comp_hyp_o")
-
-        # 4. Compute Logits (Negative Hyperbolic Distance)
-        dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0))
-        dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0))
+        # ----------------------------------------------------------------------
+        # 2. Hierarchy Features (Project cached Euclidean feats using current weights & c)
+        # ----------------------------------------------------------------------
         
-        # [OPTIMIZATION] Get Learnable Logit Scale
-        # Clamp max to 100 to prevent gradient explosion (HyCoCLIP uses 100/4.605)
+        # Coarse Verbs
+        cv_clip = self.cached_hierarchy["coarse_verb_clip"]
+        cv_emb = self.c2c_text_v(cv_clip)
+        coarse_verb_hyp = LorentzMath.exp_map_0(clip_norm(cv_emb), c=current_c)
+        
+        # Coarse Objects
+        co_clip = self.cached_hierarchy["coarse_obj_clip"]
+        co_emb = self.c2c_text_o(co_clip)
+        coarse_obj_hyp = LorentzMath.exp_map_0(clip_norm(co_emb), c=current_c)
+        
+        # Compositions
+        comp_clip = self.cached_hierarchy["comp_clip"]
+        # Comp -> Verb Space
+        comp_v_emb = self.c2c_text_v(comp_clip)
+        comp_hyp_v = LorentzMath.exp_map_0(clip_norm(comp_v_emb), c=current_c)
+        # Comp -> Object Space
+        comp_o_emb = self.c2c_text_o(comp_clip)
+        comp_hyp_o = LorentzMath.exp_map_0(clip_norm(comp_o_emb), c=current_c)
+
+        # ----------------------------------------------------------------------
+        # 3. Compute Logits
+        # ----------------------------------------------------------------------
+        dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
+        dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
+        
         logit_scale = self.logit_scale.exp()
         logit_scale = torch.clamp(logit_scale, max=100.0)
         
@@ -319,19 +335,17 @@ class CustomCLIP(nn.Module):
                 "coarse_obj_hyp": coarse_obj_hyp,
                 "comp_hyp_v": comp_hyp_v,  
                 "comp_hyp_o": comp_hyp_o,
-                "logit_scale": logit_scale # Pass scale to Loss
+                "logit_scale": logit_scale,
+                "curvature": current_c  # [PASS] Pass learnable c to Loss
             }
         else:
-            # Inference: Apply scale here for correct ranking scores
             if pairs is not None:
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                # Combine logits and scale
                 combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
                 return combined_logits * logit_scale
             else:
                 return verb_logits * logit_scale, obj_logits * logit_scale
 
-# ... load_clip_to_cpu, build_model ... (Same as before)
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
     url = clip._MODELS[backbone_name]
@@ -359,6 +373,7 @@ def build_model(train_dataset, cfg):
                 param.requires_grad = True
         elif 'c2c' in name:
             param.requires_grad = True
+        # Ensure curvature is trainable (it is by default as a Parameter, but being safe)
+        elif 'c_param' in name:
+            param.requires_grad = True
     return model
-
-
