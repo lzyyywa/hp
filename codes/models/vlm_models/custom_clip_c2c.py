@@ -176,20 +176,34 @@ class CustomCLIP(nn.Module):
 
     def _init_hyperbolic_modules(self):
         """
-        Initialize projection layers with specific distribution to avoid origin collapse.
+        [HyCoCLIP Strategy]
+        Apply Orthogonal Initialization to preserve CLIP's pre-trained geometry
+        as much as possible in the early stages.
+        Replaces the destructive Gaussian noise initialization.
         """
-        print("[CustomCLIP] Applying Hyperbolic Initialization...")
+        print("[CustomCLIP] Applying SOTA Orthogonal Initialization (Preserving Geometry)...")
+        
+        # Iterate through all trainable hyperbolic projection layers
         for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Sequential) or isinstance(m, nn.Module):
+            if isinstance(m, nn.Module):
                 for sub_m in m.modules():
+                    # Apply Orthogonal Initialization to Linear layers
                     if isinstance(sub_m, nn.Linear):
-                        nn.init.normal_(sub_m.weight, std=0.02) 
+                        # gain=1.0 means keeping the vector norm approximately unchanged
+                        nn.init.orthogonal_(sub_m.weight, gain=1.0)
                         if sub_m.bias is not None:
-                            nn.init.constant_(sub_m.bias, 0)
+                            nn.init.constant_(sub_m.bias, 0.0)
+                    
+                    # Apply Orthogonal Initialization to Conv1d layers (used in your MLP_ST)
+                    elif isinstance(sub_m, nn.Conv1d):
+                        nn.init.orthogonal_(sub_m.weight, gain=1.0)
+                        if sub_m.bias is not None:
+                            nn.init.constant_(sub_m.bias, 0.0)
+                    
+                    # Initialize LayerNorm as Identity transformation
+                    elif isinstance(sub_m, nn.LayerNorm):
+                        nn.init.constant_(sub_m.bias, 0.0)
+                        nn.init.constant_(sub_m.weight, 1.0)
 
     def _encode_plain_text(self, tokenized_prompts):
         tokenized_prompts = tokenized_prompts.to(self.model_device)
