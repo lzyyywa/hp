@@ -265,81 +265,81 @@ class CustomCLIP(nn.Module):
     def forward(self, video, pairs=None):
         device = video.device
         
-        # Check for cached EUCLIDEAN features
+        # 缓存检查
         if self.coarse_verb_tokens is not None and "coarse_verb_euc" not in self.cached_hierarchy:
             self._ensure_hierarchy_cached(device)
 
         # ----------------------------------------------------------------------
-        # 1. Backbone Extraction (Can run in Mixed Precision / FP16)
+        # 1. Backbone 提取 (允许混合精度)
         # ----------------------------------------------------------------------
-        
-        # Verbs
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         
-        # Objects
         obj_prompts = self.obj_prompt_learner()
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
 
-        # Video
         video_features = self.video_encoder(video)
 
         # ----------------------------------------------------------------------
-        # 2. Hyperbolic Operations (MUST FORCE FLOAT32 TO PREVENT NaN)
+        # 2. 双曲空间操作 (必须 FP32 + 归一化)
         # ----------------------------------------------------------------------
-        # [CRITICAL FIX] Disable AMP here. Hyperbolic math explodes in Float16.
+        # [HyCoCLIP 核心技巧] 整个双曲块强制 float32
         with torch.cuda.amp.autocast(enabled=False):
             
-            # A. Cast all inputs to Float32
-            # --------------------------------------
-            # Ensure curvature is float32
+            # 类型转换
             current_c = (F.softplus(self.c_param) + 1e-5).float()
-            
-            # Cast Backbone features to Float32
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
             video_features = video_features.float()
 
-            # B. Euclidean Projections (Linear Layers)
-            # --------------------------------------
+            # 欧氏投影
             verb_text_features = self.c2c_text_v(verb_text_features)
             obj_text_features = self.c2c_text_o(obj_text_features)
-            
             o_feat = self.c2c_OE1(video_features.mean(dim=-1))
             v_feat_t = self.c2c_VE1(video_features)
             v_feat = v_feat_t.mean(dim=-1)
 
-            # C. Euclidean -> Hyperbolic Mapping (ExpMap)
-            # --------------------------------------
-            # clip_norm helps stability, then exp_map projects to manifold
-            verb_text_hyp = LorentzMath.exp_map_0(clip_norm(verb_text_features), c=current_c)
-            obj_text_hyp = LorentzMath.exp_map_0(clip_norm(obj_text_features), c=current_c)
-            
-            o_feat_hyp = LorentzMath.exp_map_0(clip_norm(o_feat), c=current_c)
-            v_feat_hyp = LorentzMath.exp_map_0(clip_norm(v_feat), c=current_c)
+            # [关键修改] 强制 L2 归一化 (比 HyCoCLIP 的 alpha 更稳健)
+            # 确保特征不会被推到双曲边界
+            verb_text_features = F.normalize(verb_text_features, p=2, dim=-1)
+            obj_text_features = F.normalize(obj_text_features, p=2, dim=-1)
+            o_feat = F.normalize(o_feat, p=2, dim=-1)
+            v_feat = F.normalize(v_feat, p=2, dim=-1)
 
-            # D. Hierarchy Features (Retrieve -> Cast -> Project)
-            # --------------------------------------
-            # We must cast the cached tensors to float32 before usage
-            coarse_verb_hyp = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_verb_euc"].float(), c=current_c)
-            coarse_obj_hyp  = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_obj_euc"].float(),  c=current_c)
-            
-            comp_hyp_v      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_v"].float(),      c=current_c)
-            comp_hyp_o      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_o"].float(),      c=current_c)
+            # 映射到双曲空间
+            verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
+            obj_text_hyp = LorentzMath.exp_map_0(obj_text_features, c=current_c)
+            o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
+            v_feat_hyp = LorentzMath.exp_map_0(v_feat, c=current_c)
 
-            # E. Compute Logits (Hyperbolic Distance)
-            # --------------------------------------
+            # 层级特征处理 (同样需要归一化)
+            cv_euc = F.normalize(self.cached_hierarchy["coarse_verb_euc"].float(), p=2, dim=-1)
+            co_euc = F.normalize(self.cached_hierarchy["coarse_obj_euc"].float(), p=2, dim=-1)
+            coarse_verb_hyp = LorentzMath.exp_map_0(cv_euc, c=current_c)
+            coarse_obj_hyp  = LorentzMath.exp_map_0(co_euc, c=current_c)
+            
+            if "comp_euc_v" in self.cached_hierarchy:
+                cp_v = F.normalize(self.cached_hierarchy["comp_euc_v"].float(), p=2, dim=-1)
+                cp_o = F.normalize(self.cached_hierarchy["comp_euc_o"].float(), p=2, dim=-1)
+                comp_hyp_v = LorentzMath.exp_map_0(cp_v, c=current_c)
+                comp_hyp_o = LorentzMath.exp_map_0(cp_o, c=current_c)
+            else:
+                comp_hyp_v = None
+                comp_hyp_o = None
+
+            # 计算距离 (Logits)
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
-            # Ensure logit scale calculation is also in float32
-            logit_scale = self.logit_scale.exp().float()
-            logit_scale = torch.clamp(logit_scale, max=100.0)
+            # [HyCoCLIP 对齐修改] 使用 Learnable Scale 但加上 Clamp 限制
+            # 限制 max=4.6052 (即 exp(4.6) approx 100)
+            with torch.no_grad():
+                self.logit_scale.clamp_(max=4.6052)
+            logit_scale = self.logit_scale.exp()
             
             verb_logits = -dist_v 
             obj_logits = -dist_o
 
-            # Return Dictionary (All tensors are now Float32)
             if self.training:
                 return {
                     "verb_logits": verb_logits,
@@ -362,18 +362,6 @@ class CustomCLIP(nn.Module):
                     return combined_logits * logit_scale
                 else:
                     return verb_logits * logit_scale, obj_logits * logit_scale
-
-def load_clip_to_cpu(cfg):
-    backbone_name = cfg.backbone
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url)
-    try:
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
-    model = clip.build_model(state_dict or model.state_dict())
-    return model
 
 def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
