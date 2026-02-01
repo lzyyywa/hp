@@ -46,6 +46,8 @@ def get_optimizer_vlm(cfg,model):
         for name, param in model.named_parameters():
             if 'c2c' in name:
                 c2c_with_wd.append(param)
+            if 'c_param' in name:
+                c2c_no_wd.append(param)
         optimizer = torch.optim.AdamW([
             {'params':  prompt_param, 'lr': cfg.text_lr, 'weight_decay': cfg.text_wd},
             {'params': vision_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},
