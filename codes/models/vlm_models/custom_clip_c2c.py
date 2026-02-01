@@ -203,8 +203,7 @@ class CustomCLIP(nn.Module):
                     # Initialize LayerNorm as Identity transformation
                     elif isinstance(sub_m, nn.LayerNorm):
                         nn.init.constant_(sub_m.bias, 0.0)
-                        nn.init.constant_(sub_m.weight, 1.0)
-
+                        nn.init.constant_(sub_m.weight, 1.0)    
     def _encode_plain_text(self, tokenized_prompts):
         tokenized_prompts = tokenized_prompts.to(self.model_device)
         x = self.token_embedding(tokenized_prompts).type(self.text_encoder.dtype)
@@ -361,3 +360,5 @@ def build_model(train_dataset, cfg):
         elif 'c2c' in name:
             param.requires_grad = True
     return model
+
+
