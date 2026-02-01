@@ -5,6 +5,7 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
+import math # [NEW] Need math for initialization
 
 # Import the upgraded stable hyperbolic ops
 try:
@@ -18,9 +19,6 @@ _tokenizer = _Tokenizer()
 # Helper: Feature Clipping
 # ==================================================================================
 def clip_norm(x, max_norm=1.0):
-    """
-    Clamps the norm of vectors.
-    """
     norm = x.norm(p=2, dim=-1, keepdim=True)
     target_norm = torch.clamp(norm, max=max_norm)
     return x * (target_norm / (norm + 1e-6))
@@ -28,6 +26,9 @@ def clip_norm(x, max_norm=1.0):
 # ==================================================================================
 # 1. Basic Components
 # ==================================================================================
+# (MLP, MLP_ST, TextEncoder, VideoEncoder 保持不变，为了节省篇幅我略去，请保留原文件中的这些类)
+# ... [请保留原文件中的 MLP, MLP_ST, TextEncoder, VideoEncoder 类定义] ...
+# 为了确保你复制完整，我把这几个类完整写出来：
 
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -53,7 +54,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.mod(x)
-
 
 class MLP_ST(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -87,7 +87,6 @@ class MLP_ST(nn.Module):
                 x = o(x)
         return x
 
-
 class TextEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -110,7 +109,6 @@ class TextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
-
 class VideoEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -126,9 +124,8 @@ class VideoEncoder(nn.Module):
         out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
         return out
 
-
 # ==================================================================================
-# 2. CustomCLIP (Corrected Initialization & Scale)
+# 2. CustomCLIP (Learnable Scale + Identity Init)
 # ==================================================================================
 
 class CustomCLIP(nn.Module):
@@ -147,6 +144,12 @@ class CustomCLIP(nn.Module):
 
         # Use CLIP's logit scale
         self.logit_scale = clip_model.logit_scale
+
+        # [CRITICAL UPGRADE] Learnable Pre-Scaling Factors (HyCoCLIP Style)
+        # Initialize to log(0.1) approx -2.3. This replaces the hardcoded 0.1
+        # This allows the model to START stable (small norm) but LEARN to expand (large norm)
+        self.visual_alpha = nn.Parameter(torch.tensor(-2.3)) 
+        self.textual_alpha = nn.Parameter(torch.tensor(-2.3))
 
         try:
             fc_emb = cfg.fc_emb.split(',')
@@ -169,20 +172,18 @@ class CustomCLIP(nn.Module):
         self.positional_embedding = clip_model.positional_embedding
         self.model_device = next(self.parameters()).device
         
-        # [CRITICAL] Apply Identity Initialization
+        # Apply Identity Initialization
         self._init_hyperbolic_modules()
 
     def _init_hyperbolic_modules(self):
         print("[CustomCLIP] Applying Identity Initialization (Preserving CLIP Alignment)...")
-        # Initialize projections to Identity so we start with valid CLIP features
         for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
             if isinstance(m, nn.Module):
                 for sub_m in m.modules():
                     if isinstance(sub_m, nn.Linear):
-                        # [FIX] Force Identity Init when dimensions match
+                        # Force Identity Init
                         if sub_m.in_features == sub_m.out_features:
                             nn.init.eye_(sub_m.weight)
-                            # Add tiny noise to break perfect symmetry
                             sub_m.weight.data.add_(torch.randn_like(sub_m.weight) * 0.001)
                         else:
                             nn.init.orthogonal_(sub_m.weight, gain=1.0)
@@ -191,7 +192,6 @@ class CustomCLIP(nn.Module):
                             nn.init.constant_(sub_m.bias, 0.0)
                     
                     elif isinstance(sub_m, nn.Conv1d):
-                         # For Conv1d (k=3), we want center to be 1, others 0
                          nn.init.dirac_(sub_m.weight) 
                          if sub_m.bias is not None:
                             nn.init.constant_(sub_m.bias, 0.0)
@@ -266,7 +266,7 @@ class CustomCLIP(nn.Module):
         video_features = self.video_encoder(video)
 
         # ----------------------------------------------------------------------
-        # 2. Hyperbolic Operations (Identity Init + Pre-scale)
+        # 2. Hyperbolic Operations (Identity Init + Dynamic Scaling)
         # ----------------------------------------------------------------------
         with torch.cuda.amp.autocast(enabled=False):
             
@@ -275,22 +275,22 @@ class CustomCLIP(nn.Module):
             obj_text_features = obj_text_features.float()
             video_features = video_features.float()
 
-            # Projections (Now initialized to Identity, so output ~= input)
+            # Projections
             verb_text_features = self.c2c_text_v(verb_text_features)
             obj_text_features = self.c2c_text_o(obj_text_features)
             o_feat = self.c2c_OE1(video_features.mean(dim=-1))
             v_feat_t = self.c2c_VE1(video_features)
             v_feat = v_feat_t.mean(dim=-1)
 
-            # [CRITICAL] Mimic HyCoCLIP initialization behavior
-            # HyCoCLIP uses visual_alpha ~ 0.04 (log(-3)). 
-            # We use 0.1 for stability and explicit normalization.
-            PRE_SCALE = 0.1
+            # [CRITICAL FIX] Use Learnable Scaling Factors (alpha)
+            # This allows features to grow larger than 0.1 during training
+            v_scale = self.visual_alpha.exp()
+            t_scale = self.textual_alpha.exp()
             
-            verb_text_features = F.normalize(verb_text_features, p=2, dim=-1) * PRE_SCALE
-            obj_text_features = F.normalize(obj_text_features, p=2, dim=-1) * PRE_SCALE
-            o_feat = F.normalize(o_feat, p=2, dim=-1) * PRE_SCALE
-            v_feat = F.normalize(v_feat, p=2, dim=-1) * PRE_SCALE
+            verb_text_features = F.normalize(verb_text_features, p=2, dim=-1) * t_scale
+            obj_text_features = F.normalize(obj_text_features, p=2, dim=-1) * t_scale
+            o_feat = F.normalize(o_feat, p=2, dim=-1) * v_scale
+            v_feat = F.normalize(v_feat, p=2, dim=-1) * v_scale
 
             # Map to Hyperbolic
             verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
@@ -298,15 +298,15 @@ class CustomCLIP(nn.Module):
             o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
             v_feat_hyp = LorentzMath.exp_map_0(v_feat, c=current_c)
 
-            # Hierarchy Features (Apply same scaling)
-            cv_euc = F.normalize(self.cached_hierarchy["coarse_verb_euc"].float(), p=2, dim=-1) * PRE_SCALE
-            co_euc = F.normalize(self.cached_hierarchy["coarse_obj_euc"].float(), p=2, dim=-1) * PRE_SCALE
+            # Hierarchy Features (Apply same textual scaling)
+            cv_euc = F.normalize(self.cached_hierarchy["coarse_verb_euc"].float(), p=2, dim=-1) * t_scale
+            co_euc = F.normalize(self.cached_hierarchy["coarse_obj_euc"].float(), p=2, dim=-1) * t_scale
             coarse_verb_hyp = LorentzMath.exp_map_0(cv_euc, c=current_c)
             coarse_obj_hyp  = LorentzMath.exp_map_0(co_euc, c=current_c)
             
             if "comp_euc_v" in self.cached_hierarchy:
-                cp_v = F.normalize(self.cached_hierarchy["comp_euc_v"].float(), p=2, dim=-1) * PRE_SCALE
-                cp_o = F.normalize(self.cached_hierarchy["comp_euc_o"].float(), p=2, dim=-1) * PRE_SCALE
+                cp_v = F.normalize(self.cached_hierarchy["comp_euc_v"].float(), p=2, dim=-1) * t_scale
+                cp_o = F.normalize(self.cached_hierarchy["comp_euc_o"].float(), p=2, dim=-1) * t_scale
                 comp_hyp_v = LorentzMath.exp_map_0(cp_v, c=current_c)
                 comp_hyp_o = LorentzMath.exp_map_0(cp_o, c=current_c)
             else:
@@ -317,7 +317,7 @@ class CustomCLIP(nn.Module):
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
-            # Logit Scale: Clamp max to ~100 (matches HyCoCLIP)
+            # Logit Scale: Clamp max to ~100
             with torch.no_grad():
                 self.logit_scale.clamp_(max=4.6052)
             logit_scale = self.logit_scale.exp()
@@ -370,6 +370,7 @@ def build_model(train_dataset, cfg):
     clip_model.float()
     print("Building custom CLIP (Hyperbolic Version)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
+    # [NEW] Make sure our new alpha parameters are trainable
     for name, param in model.named_parameters():
         param.requires_grad_(False)
         if "prompt_learner" in name and cfg.learn_input_method != 'zero':
@@ -380,5 +381,7 @@ def build_model(train_dataset, cfg):
         elif 'c2c' in name:
             param.requires_grad = True
         elif 'c_param' in name:
+            param.requires_grad = True
+        elif 'visual_alpha' in name or 'textual_alpha' in name:
             param.requires_grad = True
     return model
