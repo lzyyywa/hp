@@ -159,7 +159,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             # 4. Record loss values
             for k, v in loss_dict.items():
-                loss_meters[k].append(v)
+              if k not in loss_meters:
+                  loss_meters[k] = []
+              loss_meters[k].append(v)
 
             progress_bar.set_postfix({
                 "Total": f"{np.mean(loss_meters['Total'][-50:]):.3f}",
