@@ -265,85 +265,103 @@ class CustomCLIP(nn.Module):
     def forward(self, video, pairs=None):
         device = video.device
         
-        # [NEW] Dynamic Curvature Calculation
-        # Ensure c > 0 using softplus and minimum bound
-        current_c = F.softplus(self.c_param) + 1e-5
-        
         # Check for cached EUCLIDEAN features
         if self.coarse_verb_tokens is not None and "coarse_verb_euc" not in self.cached_hierarchy:
             self._ensure_hierarchy_cached(device)
 
         # ----------------------------------------------------------------------
-        # 1. Fine-grained Feature Extraction (Euclidean) -> Projection -> Hyperbolic
+        # 1. Backbone Extraction (Can run in Mixed Precision / FP16)
         # ----------------------------------------------------------------------
         
         # Verbs
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
-        verb_text_features = self.c2c_text_v(verb_text_features)
-        verb_text_hyp = LorentzMath.exp_map_0(clip_norm(verb_text_features), c=current_c)
-
+        
         # Objects
         obj_prompts = self.obj_prompt_learner()
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
-        obj_text_features = self.c2c_text_o(obj_text_features)
-        obj_text_hyp = LorentzMath.exp_map_0(clip_norm(obj_text_features), c=current_c)
 
         # Video
         video_features = self.video_encoder(video)
-        o_feat = self.c2c_OE1(video_features.mean(dim=-1))
-        v_feat_t = self.c2c_VE1(video_features)
-        v_feat = v_feat_t.mean(dim=-1)
-
-        # Project Video to Hyperbolic (using current_c)
-        o_feat_hyp = LorentzMath.exp_map_0(clip_norm(o_feat), c=current_c)
-        v_feat_hyp = LorentzMath.exp_map_0(clip_norm(v_feat), c=current_c)
 
         # ----------------------------------------------------------------------
-        # 2. Hierarchy Features (LIVE PROJECTION using current_c)
+        # 2. Hyperbolic Operations (MUST FORCE FLOAT32 TO PREVENT NaN)
         # ----------------------------------------------------------------------
-        # Retrieve Euclidean Cache -> Apply ExpMap(c)
-        
-        coarse_verb_hyp = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_verb_euc"], c=current_c)
-        coarse_obj_hyp  = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_obj_euc"],  c=current_c)
-        
-        comp_hyp_v      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_v"],      c=current_c)
-        comp_hyp_o      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_o"],      c=current_c)
+        # [CRITICAL FIX] Disable AMP here. Hyperbolic math explodes in Float16.
+        with torch.cuda.amp.autocast(enabled=False):
+            
+            # A. Cast all inputs to Float32
+            # --------------------------------------
+            # Ensure curvature is float32
+            current_c = (F.softplus(self.c_param) + 1e-5).float()
+            
+            # Cast Backbone features to Float32
+            verb_text_features = verb_text_features.float()
+            obj_text_features = obj_text_features.float()
+            video_features = video_features.float()
 
-        # ----------------------------------------------------------------------
-        # 3. Compute Logits
-        # ----------------------------------------------------------------------
-        dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
-        dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
-        
-        logit_scale = self.logit_scale.exp()
-        logit_scale = torch.clamp(logit_scale, max=100.0)
-        
-        verb_logits = -dist_v 
-        obj_logits = -dist_o
+            # B. Euclidean Projections (Linear Layers)
+            # --------------------------------------
+            verb_text_features = self.c2c_text_v(verb_text_features)
+            obj_text_features = self.c2c_text_o(obj_text_features)
+            
+            o_feat = self.c2c_OE1(video_features.mean(dim=-1))
+            v_feat_t = self.c2c_VE1(video_features)
+            v_feat = v_feat_t.mean(dim=-1)
 
-        if self.training:
-            return {
-                "verb_logits": verb_logits,
-                "obj_logits": obj_logits,
-                "v_feat_hyp": v_feat_hyp,
-                "o_feat_hyp": o_feat_hyp,
-                "verb_text_hyp": verb_text_hyp,
-                "obj_text_hyp": obj_text_hyp,
-                "coarse_verb_hyp": coarse_verb_hyp,
-                "coarse_obj_hyp": coarse_obj_hyp,
-                "comp_hyp_v": comp_hyp_v,  
-                "comp_hyp_o": comp_hyp_o,
-                "logit_scale": logit_scale,
-                "curvature": current_c  # [PASS] Pass learnable c to Loss
-            }
-        else:
-            if pairs is not None:
-                verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
-                return combined_logits * logit_scale
+            # C. Euclidean -> Hyperbolic Mapping (ExpMap)
+            # --------------------------------------
+            # clip_norm helps stability, then exp_map projects to manifold
+            verb_text_hyp = LorentzMath.exp_map_0(clip_norm(verb_text_features), c=current_c)
+            obj_text_hyp = LorentzMath.exp_map_0(clip_norm(obj_text_features), c=current_c)
+            
+            o_feat_hyp = LorentzMath.exp_map_0(clip_norm(o_feat), c=current_c)
+            v_feat_hyp = LorentzMath.exp_map_0(clip_norm(v_feat), c=current_c)
+
+            # D. Hierarchy Features (Retrieve -> Cast -> Project)
+            # --------------------------------------
+            # We must cast the cached tensors to float32 before usage
+            coarse_verb_hyp = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_verb_euc"].float(), c=current_c)
+            coarse_obj_hyp  = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_obj_euc"].float(),  c=current_c)
+            
+            comp_hyp_v      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_v"].float(),      c=current_c)
+            comp_hyp_o      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_o"].float(),      c=current_c)
+
+            # E. Compute Logits (Hyperbolic Distance)
+            # --------------------------------------
+            dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
+            dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
+            
+            # Ensure logit scale calculation is also in float32
+            logit_scale = self.logit_scale.exp().float()
+            logit_scale = torch.clamp(logit_scale, max=100.0)
+            
+            verb_logits = -dist_v 
+            obj_logits = -dist_o
+
+            # Return Dictionary (All tensors are now Float32)
+            if self.training:
+                return {
+                    "verb_logits": verb_logits,
+                    "obj_logits": obj_logits,
+                    "v_feat_hyp": v_feat_hyp,
+                    "o_feat_hyp": o_feat_hyp,
+                    "verb_text_hyp": verb_text_hyp,
+                    "obj_text_hyp": obj_text_hyp,
+                    "coarse_verb_hyp": coarse_verb_hyp,
+                    "coarse_obj_hyp": coarse_obj_hyp,
+                    "comp_hyp_v": comp_hyp_v,  
+                    "comp_hyp_o": comp_hyp_o,
+                    "logit_scale": logit_scale,
+                    "curvature": current_c  
+                }
             else:
-                return verb_logits * logit_scale, obj_logits * logit_scale
+                if pairs is not None:
+                    verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
+                    combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
+                    return combined_logits * logit_scale
+                else:
+                    return verb_logits * logit_scale, obj_logits * logit_scale
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
