@@ -121,40 +121,42 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
 
-            # [CRITICAL FIX] AMP Scope Management
-            # We run the Forward pass in AMP (Mixed Precision) for speed
-            with torch.cuda.amp.autocast(enabled=True):
+            # ==================================================================================
+            # [HyCoCLIP STRATEGY] 
+            # 1. Use AMP for Backbone (ViT/ResNet) for efficiency.
+            # 2. The model.forward() handles switching to Float32 for Hyperbolic Ops internally.
+            # 3. If you still see NaN, verify custom_clip_c2c.py has 'autocast(enabled=False)'
+            # ==================================================================================
+
+            # [DEBUG MODE]: To disable AMP completely (Pure Float32), comment out the 'with' line below
+            # and un-indent the code block inside it.
+            with torch.cuda.amp.autocast(enabled=True): 
+                # Model output is GUARANTEED to be Float32 if custom_clip_c2c.py is updated correctly
                 out = model(batch_img)
-            
-            # [CRITICAL FIX] Force Loss Calculation in Float32
-            # Hyperbolic operations (acosh, exp_map) are unstable in float16.
-            # We exit the autocast context and cast outputs to float32.
-            
-            # Cast all hyperbolic features in 'out' dict to float32
-            out_f32 = {}
-            for k, v in out.items():
-                if isinstance(v, torch.Tensor) and v.is_floating_point():
-                    out_f32[k] = v.float() 
-                else:
-                    out_f32[k] = v
-            
-            # Calculate Loss in FP32
-            loss, loss_dict = criterion(out_f32, batch_verb, batch_obj, batch_target, 
-                                      p2v, p2o, v2cv, o2co)
-            
-            loss = loss / config.gradient_accumulation_steps
+                
+                # Calculate Loss (Inputs are Float32, so calculation stays in Float32)
+                loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
+                                          p2v, p2o, v2cv, o2co)
+                
+                loss = loss / config.gradient_accumulation_steps
 
             # 3. Backward propagation
-            # Scaler handles the mixed precision backward pass
+            # [DEBUG MODE]: If disabling AMP, comment out 'scaler.scale(loss).backward()'
+            # and uncomment 'loss.backward()' below.
             scaler.scale(loss).backward()
+            # loss.backward() # [Uncomment this for Pure Float32 Debug]
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
+                # [DEBUG MODE]: If disabling AMP, comment out scaler lines and use optimizer.step() directly.
                 scaler.unscale_(optimizer)
+                
                 # Gradient Clipping is good practice for Hyperbolic Networks
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
+                # optimizer.step() # [Uncomment this for Pure Float32 Debug]
+                
                 optimizer.zero_grad()
 
             # 4. Record loss values
@@ -229,5 +231,3 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         print("Final Evaluation")
         model.load_state_dict(torch.load(os.path.join(config.save_path, "best.pt")))
         evaluate(model, test_dataset, config)
-
-
