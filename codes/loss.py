@@ -29,14 +29,14 @@ class HyperbolicPrototypicalLoss(nn.Module):
     """
     Discriminative Loss in Hyperbolic Space.
     
-    [FIX] Now accepts dynamic logit_scale AND dynamic curvature 'c'.
+    [FIXED] Now correctly accepts dynamic logit_scale AND dynamic curvature 'c'.
     """
     def __init__(self):
         super(HyperbolicPrototypicalLoss, self).__init__()
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, query_emb, prototype_emb, targets, logit_scale=100.0, c=1.0):
-        # [NEW] Accept c argument
+        # [CRITICAL FIX] c is now passed as an argument, not stored in self
         q = query_emb.unsqueeze(1)
         p = prototype_emb.unsqueeze(0)
         
@@ -60,10 +60,10 @@ class EntailmentConeLoss(nn.Module):
         self.min_radius = min_radius
         self.margin = margin
         self.aperture_scale = aperture_scale 
-        # [FIX] Removed fixed self.c = 1.0
+        # [FIXED] Removed fixed self.c = 1.0 to ensure dynamic curvature usage
 
     def forward(self, child_emb, parent_emb, c=1.0):
-        # [NEW] Accept c argument
+        # [CRITICAL FIX] Using the passed 'c' for all geometric calculations
         
         # 1. Calculate actual hyperbolic angle
         angle = LorentzMath.oxy_angle(parent_emb, child_emb, c=c)
@@ -111,23 +111,23 @@ class H2EMTotalLoss(nn.Module):
         verb_logits = out['verb_logits']
         obj_logits = out['obj_logits']
         
-        # [NEW] Get Learnable Scale & Curvature
+        # [NEW] Get Learnable Scale & Curvature from Model Output
         logit_scale = out['logit_scale']
         current_c = out['curvature']
 
         # A. Primitive Auxiliary (L_s + L_o)
-        # Pass logit_scale and c
+        # Pass logit_scale and c to the loss function
         L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb, logit_scale, c=current_c)
         L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj, logit_scale, c=current_c)
         L_prim = L_s + L_o
 
         # B. Discriminative Alignment (L_DA)
-        # Scale is applied, c is implicitly used in distance calculation upstream
+        # Scale is applied, c is implicitly used in distance calculation upstream (in model.forward)
         pair_logits = verb_logits[:, p2v_map] + obj_logits[:, p2o_map]
         L_DA = F.cross_entropy(pair_logits * logit_scale, batch_target)
 
         # C. Taxonomic Entailment (L_TE)
-        # Pass c to cone loss
+        # [CRITICAL] Pass 'current_c' to cone loss ensures consistency with model projection
         loss_h1 = self.loss_cone(child_emb=verb_text_hyp, parent_emb=coarse_verb_hyp[v2cv_map], c=current_c)
         loss_h2 = self.loss_cone(child_emb=obj_text_hyp, parent_emb=coarse_obj_hyp[o2co_map], c=current_c)
         loss_h3 = self.loss_cone(child_emb=comp_hyp_v, parent_emb=verb_text_hyp[p2v_map], c=current_c)
@@ -143,7 +143,7 @@ class H2EMTotalLoss(nn.Module):
             "Prim": L_prim.item(),
             "DA": L_DA.item(),
             "TE": L_TE.item(),
-            "Curvature": current_c.item() # Monitor curvature
+            "Curvature": current_c.item() # Monitor curvature during training
         }
 
 # =========================================================================
