@@ -15,16 +15,13 @@ except ImportError:
 _tokenizer = _Tokenizer()
 
 # ==================================================================================
-# Helper: Feature Clipping (HyCoCLIP Practice)
+# Helper: Feature Clipping
 # ==================================================================================
 def clip_norm(x, max_norm=1.0):
     """
     Clamps the norm of vectors in Euclidean space before projecting to Hyperbolic space.
-    Prevents numerical instability (NaN) caused by extremely large norms in exp_map.
-    Ref: HyCoCLIP uses max_norm around 15.0.
     """
     norm = x.norm(p=2, dim=-1, keepdim=True)
-    # If norm > max_norm, scale it down. Otherwise, keep it as is.
     target_norm = torch.clamp(norm, max=max_norm)
     return x * (target_norm / (norm + 1e-6))
 
@@ -147,7 +144,6 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         
         # [NEW] Learnable Curvature Parameter
-        # Initialized to 1.0. Wrapped in nn.Parameter to be optimized.
         self.c_param = nn.Parameter(torch.tensor(1.0))
 
         # [OPTIMIZATION] Use CLIP's learnable logit scale
@@ -178,15 +174,7 @@ class CustomCLIP(nn.Module):
         self._init_hyperbolic_modules()
 
     def _init_hyperbolic_modules(self):
-        """
-        [HyCoCLIP Strategy]
-        Apply Orthogonal Initialization to preserve CLIP's pre-trained geometry
-        as much as possible in the early stages.
-        Replaces the destructive Gaussian noise initialization.
-        """
         print("[CustomCLIP] Applying SOTA Orthogonal Initialization (Preserving Geometry)...")
-        
-        # Iterate through all trainable hyperbolic projection layers
         for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
             if isinstance(m, nn.Module):
                 for sub_m in m.modules():
@@ -217,12 +205,6 @@ class CustomCLIP(nn.Module):
         print(f"[CustomCLIP] Ready to cache.")
 
     def _ensure_hierarchy_cached(self, device):
-        """
-        [CACHING STRATEGY UPDATE - CRITICAL]
-        We now cache the EUCLIDEAN embeddings (Static), NOT the Hyperbolic ones.
-        This allows us to re-project them using the updated projection layers 
-        and the updated curvature 'c' in every forward pass.
-        """
         if "coarse_verb_euc" in self.cached_hierarchy:
             return 
 
@@ -233,7 +215,7 @@ class CustomCLIP(nn.Module):
             # 1. Coarse Verbs (Compute EUCLIDEAN)
             cv_emb = self._encode_plain_text(self.coarse_verb_tokens)
             cv_emb = self.c2c_text_v(cv_emb) # Linear projection
-            # Store Euclidean, normalized (clipped) for stability, but NO exp_map here
+            # Store Euclidean, normalized (clipped) for stability
             self.cached_hierarchy["coarse_verb_euc"] = clip_norm(cv_emb)
 
             # 2. Coarse Objects (Compute EUCLIDEAN)
@@ -362,6 +344,22 @@ class CustomCLIP(nn.Module):
                     return combined_logits * logit_scale
                 else:
                     return verb_logits * logit_scale, obj_logits * logit_scale
+
+# ==================================================================================
+# 3. GLOBAL Helper Functions (Must NOT be indented inside class)
+# ==================================================================================
+
+def load_clip_to_cpu(cfg):
+    backbone_name = cfg.backbone
+    url = clip._MODELS[backbone_name]
+    model_path = clip._download(url)
+    try:
+        model = torch.jit.load(model_path, map_location="cpu").eval()
+        state_dict = None
+    except RuntimeError:
+        state_dict = torch.load(model_path, map_location="cpu")
+    model = clip.build_model(state_dict or model.state_dict())
+    return model
 
 def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
