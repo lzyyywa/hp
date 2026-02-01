@@ -114,7 +114,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
+         
         
+
         for bid, batch in enumerate(train_dataloader):
             batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
@@ -135,10 +137,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 out = model(batch_img)
                 
                 # Calculate Loss (Inputs are Float32, so calculation stays in Float32)
-                loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
+            loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
                                           p2v, p2o, v2cv, o2co)
                 
-                loss = loss / config.gradient_accumulation_steps
+            loss = loss / config.gradient_accumulation_steps
 
             # 3. Backward propagation
             # [DEBUG MODE]: If disabling AMP, comment out 'scaler.scale(loss).backward()'
