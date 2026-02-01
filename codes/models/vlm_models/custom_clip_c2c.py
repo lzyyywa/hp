@@ -218,27 +218,30 @@ class CustomCLIP(nn.Module):
 
     def _ensure_hierarchy_cached(self, device):
         """
-        [CACHING STRATEGY UPDATE]
-        We now cache the EUCLIDEAN CLIP embeddings (Static), not the Hyperbolic ones.
+        [CACHING STRATEGY UPDATE - CRITICAL]
+        We now cache the EUCLIDEAN embeddings (Static), NOT the Hyperbolic ones.
         This allows us to re-project them using the updated projection layers 
         and the updated curvature 'c' in every forward pass.
         """
-        if "coarse_verb_clip" in self.cached_hierarchy:
+        if "coarse_verb_euc" in self.cached_hierarchy:
             return 
 
         print(f"[CustomCLIP] Computing and caching EUCLIDEAN hierarchy features on {device}...")
         self.model_device = device
         
         with torch.no_grad():
-            # 1. Coarse Verbs (Store CLIP output)
+            # 1. Coarse Verbs (Compute EUCLIDEAN)
             cv_emb = self._encode_plain_text(self.coarse_verb_tokens)
-            self.cached_hierarchy["coarse_verb_clip"] = cv_emb.detach()
+            cv_emb = self.c2c_text_v(cv_emb) # Linear projection
+            # Store Euclidean, normalized (clipped) for stability, but NO exp_map here
+            self.cached_hierarchy["coarse_verb_euc"] = clip_norm(cv_emb)
 
-            # 2. Coarse Objects (Store CLIP output)
+            # 2. Coarse Objects (Compute EUCLIDEAN)
             co_emb = self._encode_plain_text(self.coarse_obj_tokens)
-            self.cached_hierarchy["coarse_obj_clip"] = co_emb.detach()
+            co_emb = self.c2c_text_o(co_emb) # Linear projection
+            self.cached_hierarchy["coarse_obj_euc"] = clip_norm(co_emb)
 
-            # 3. Compositions (Store CLIP output)
+            # 3. Compositions (Compute EUCLIDEAN)
             batch_size = 500
             comp_embs = []
             total = self.comp_tokens.shape[0]
@@ -248,9 +251,16 @@ class CustomCLIP(nn.Module):
                 comp_embs.append(emb.cpu())
             
             comp_emb_all = torch.cat(comp_embs, dim=0).to(device)
-            self.cached_hierarchy["comp_clip"] = comp_emb_all.detach()
             
-        print(f"[CustomCLIP] Cache finished.")
+            # Project Compositions to Verb Space (Euclidean)
+            comp_v_euc = self.c2c_text_v(comp_emb_all)
+            self.cached_hierarchy["comp_euc_v"] = clip_norm(comp_v_euc)
+
+            # Project Compositions to Object Space (Euclidean)
+            comp_o_euc = self.c2c_text_o(comp_emb_all)
+            self.cached_hierarchy["comp_euc_o"] = clip_norm(comp_o_euc)
+            
+        print(f"[CustomCLIP] Euclidean Cache finished.")
 
     def forward(self, video, pairs=None):
         device = video.device
@@ -259,7 +269,8 @@ class CustomCLIP(nn.Module):
         # Ensure c > 0 using softplus and minimum bound
         current_c = F.softplus(self.c_param) + 1e-5
         
-        if self.coarse_verb_tokens is not None and "coarse_verb_clip" not in self.cached_hierarchy:
+        # Check for cached EUCLIDEAN features
+        if self.coarse_verb_tokens is not None and "coarse_verb_euc" not in self.cached_hierarchy:
             self._ensure_hierarchy_cached(device)
 
         # ----------------------------------------------------------------------
@@ -289,27 +300,15 @@ class CustomCLIP(nn.Module):
         v_feat_hyp = LorentzMath.exp_map_0(clip_norm(v_feat), c=current_c)
 
         # ----------------------------------------------------------------------
-        # 2. Hierarchy Features (Project cached Euclidean feats using current weights & c)
+        # 2. Hierarchy Features (LIVE PROJECTION using current_c)
         # ----------------------------------------------------------------------
+        # Retrieve Euclidean Cache -> Apply ExpMap(c)
         
-        # Coarse Verbs
-        cv_clip = self.cached_hierarchy["coarse_verb_clip"]
-        cv_emb = self.c2c_text_v(cv_clip)
-        coarse_verb_hyp = LorentzMath.exp_map_0(clip_norm(cv_emb), c=current_c)
+        coarse_verb_hyp = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_verb_euc"], c=current_c)
+        coarse_obj_hyp  = LorentzMath.exp_map_0(self.cached_hierarchy["coarse_obj_euc"],  c=current_c)
         
-        # Coarse Objects
-        co_clip = self.cached_hierarchy["coarse_obj_clip"]
-        co_emb = self.c2c_text_o(co_clip)
-        coarse_obj_hyp = LorentzMath.exp_map_0(clip_norm(co_emb), c=current_c)
-        
-        # Compositions
-        comp_clip = self.cached_hierarchy["comp_clip"]
-        # Comp -> Verb Space
-        comp_v_emb = self.c2c_text_v(comp_clip)
-        comp_hyp_v = LorentzMath.exp_map_0(clip_norm(comp_v_emb), c=current_c)
-        # Comp -> Object Space
-        comp_o_emb = self.c2c_text_o(comp_clip)
-        comp_hyp_o = LorentzMath.exp_map_0(clip_norm(comp_o_emb), c=current_c)
+        comp_hyp_v      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_v"],      c=current_c)
+        comp_hyp_o      = LorentzMath.exp_map_0(self.cached_hierarchy["comp_euc_o"],      c=current_c)
 
         # ----------------------------------------------------------------------
         # 3. Compute Logits
