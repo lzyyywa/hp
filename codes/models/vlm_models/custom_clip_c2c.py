@@ -17,7 +17,7 @@ _tokenizer = _Tokenizer()
 # ==================================================================================
 # Helper: Feature Clipping (HyCoCLIP Practice)
 # ==================================================================================
-def clip_norm(x, max_norm=15.0):
+def clip_norm(x, max_norm=1.0):
     """
     Clamps the norm of vectors in Euclidean space before projecting to Hyperbolic space.
     Prevents numerical instability (NaN) caused by extremely large norms in exp_map.
