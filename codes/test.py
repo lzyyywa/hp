@@ -27,7 +27,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Evaluator:
     """
-    Evaluator class (Unchanged logic, safe for Hyperbolic Logits)
+    Evaluator class (Hyperbolic Safe)
     """
 
     def __init__(self, dset, model):
@@ -312,7 +312,7 @@ def predict_logits(model, dataset, config):
     # Create pairs tensor on GPU
     pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                           for attr, obj in pairs_dataset]).cuda()
-                          
+                                  
     dataloader = DataLoader(
         dataset,
         batch_size=config.eval_batch_size,
@@ -558,5 +558,3 @@ if __name__ == "__main__":
         json.dump(results, fp)
 
     print("done!")
-
-
