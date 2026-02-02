@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange
 import math
 
+# [HyCoCLIP Requirement] 必须使用正确的双曲算子
 try:
     from utils.hyperbolic_ops import LorentzMath
 except ImportError:
@@ -124,17 +125,32 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
         
-        # [FIX 1] Curvature Initialization: Start flat (small c)
-        # softplus(-5.0) approx 0.006, close to Euclidean
-        self.c_param = nn.Parameter(torch.tensor(-5.0))
+        # ---------------------------------------------------------------------
+        # [HyCoCLIP Alignment 1] Curvature Initialization
+        # Reference: hycoclip/models.py lines 155-160
+        # "Initialize curvature parameter. Hyperboloid curvature will be -curv."
+        # Init to 1.0 (log space = 0.0)
+        # ---------------------------------------------------------------------
+        self.c_param = nn.Parameter(torch.tensor(1.0).log())
+        
+        # Constraints for curvature learning
+        self._curv_minmax = {
+            "max": math.log(1.0 * 10), # log(10) ≈ 2.3
+            "min": math.log(1.0 / 10), # log(0.1) ≈ -2.3
+        }
 
-        # CLIP Logit Scale
+        # CLIP Logit Scale (learnable)
         self.logit_scale = clip_model.logit_scale
 
-        # [FIX 2] Alpha Initialization: Start with scale=1.0
-        # exp(0.0) = 1.0. Prevents feature collapse at origin.
-        self.visual_alpha = nn.Parameter(torch.tensor(0.0)) 
-        self.textual_alpha = nn.Parameter(torch.tensor(0.0))
+        # ---------------------------------------------------------------------
+        # [HyCoCLIP Alignment 2] Alpha (Scale) Initialization
+        # Reference: hycoclip/models.py lines 167-169
+        # "Learnable scalars to ensure that image/text features have an expected unit norm"
+        # CRITICAL: Init to log(1 / sqrt(dim)). For dim=512, scale ~= 0.044
+        # ---------------------------------------------------------------------
+        init_scale = float(cfg.emb_dim) ** -0.5
+        self.visual_alpha = nn.Parameter(torch.tensor(init_scale).log())
+        self.textual_alpha = nn.Parameter(torch.tensor(init_scale).log())
 
         try:
             fc_emb = cfg.fc_emb.split(',')
@@ -142,6 +158,7 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
+        # Projection layers (Your specific C2C architecture)
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                            dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
@@ -156,6 +173,7 @@ class CustomCLIP(nn.Module):
         self.positional_embedding = clip_model.positional_embedding
         self.model_device = next(self.parameters()).device
         
+        # Apply strict identity init as per your previous requirement
         self._init_hyperbolic_modules()
 
     def _init_hyperbolic_modules(self):
@@ -194,6 +212,7 @@ class CustomCLIP(nn.Module):
         print(f"[CustomCLIP] Ready to cache.")
 
     def _ensure_hierarchy_cached(self, device):
+        # Only cache BACKBONE features (Frozen)
         if "coarse_verb_backbone" in self.cached_hierarchy:
             return 
 
@@ -235,8 +254,16 @@ class CustomCLIP(nn.Module):
         video_features = self.video_encoder(video)
 
         with torch.cuda.amp.autocast(enabled=False):
-            # [FIX 1] Softplus + 1e-5 to avoid 0, but starting from -5 param makes it small (~0.006)
-            current_c = (F.softplus(self.c_param) + 1e-5).float()
+            # -----------------------------------------------------------------
+            # [HyCoCLIP Alignment 3] Clamping Logic
+            # Reference: hycoclip/models.py lines 208-215
+            # -----------------------------------------------------------------
+            self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
+            current_c = self.c_param.exp() # Use exp(), not softplus
+            
+            self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
+            self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+            
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
             video_features = video_features.float()
@@ -248,7 +275,7 @@ class CustomCLIP(nn.Module):
             v_feat_t = self.c2c_VE1(video_features)
             v_feat = v_feat_t.mean(dim=-1)
 
-            # [B] Hierarchy Projection
+            # [B] Hierarchy Projection (Uses cached backbone)
             cv_backbone = self.cached_hierarchy["coarse_verb_backbone"]
             co_backbone = self.cached_hierarchy["coarse_obj_backbone"]
             comp_backbone = self.cached_hierarchy["comp_backbone"]
@@ -258,7 +285,11 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
-            # [FIX 2] Dynamic Scaling: exp(0.0) = 1.0. Start with full norm.
+            # [HyCoCLIP Alignment 4] Scaling
+            # Scale Euclidean features BEFORE mapping.
+            # HyCoCLIP does not explicitly normalize before scaling in `encode_image` if `project=False`
+            # BUT we assume CLIP features are roughly normalized. 
+            # Safe bet: Normalize to unit ball, then scale by `exp(alpha)` (which is small, ~0.044)
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
@@ -272,7 +303,7 @@ class CustomCLIP(nn.Module):
             comp_v_euc = F.normalize(comp_v_euc, p=2, dim=-1) * t_scale
             comp_o_euc = F.normalize(comp_o_euc, p=2, dim=-1) * t_scale
 
-            # [D] Map to Hyperbolic
+            # [D] Map to Hyperbolic (ExpMap0)
             verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
             obj_text_hyp = LorentzMath.exp_map_0(obj_text_features, c=current_c)
             o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
@@ -287,12 +318,12 @@ class CustomCLIP(nn.Module):
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
+            # [HyCoCLIP Alignment 5] Logit Scale
             with torch.no_grad():
                 self.logit_scale.clamp_(max=4.6052)
             logit_scale = self.logit_scale.exp()
             
-            # [FIX 3] Apply Logit Scale HERE for Training
-            # The raw dist is just distance (e.g., 2.0). CrossEntropy expects Logits (e.g., 2.0 * 100)
+            # Returns SCALED LOGITS (Negative Distance * Scale)
             verb_logits = -dist_v * logit_scale
             obj_logits = -dist_o * logit_scale
 
@@ -314,9 +345,6 @@ class CustomCLIP(nn.Module):
             else:
                 if pairs is not None:
                     verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                    # Since we already multiplied by logit_scale above, we just sum them here
-                    # Note: Original C2C might sum then scale, or scale then sum. 
-                    # Scale then sum is mathematically safer here.
                     combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
                     return combined_logits 
                 else:
@@ -338,7 +366,7 @@ def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Hyperbolic Version)")
+    print("Building custom CLIP (Hyperbolic Version - HyCoCLIP Init Aligned)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     for name, param in model.named_parameters():
         param.requires_grad_(False)
