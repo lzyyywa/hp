@@ -1,390 +1,128 @@
-import torch
-import torch.nn as nn
-from clip import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
-from models.vlm_models.text_learner import get_text_learner
+from torch.nn.modules.loss import CrossEntropyLoss
 import torch.nn.functional as F
-from einops import rearrange
-import math
+import torch.nn as nn
+import torch
+import numpy as np
 
-# Import the upgraded stable hyperbolic ops
+# Import the upgraded hyperbolic operations
 try:
     from utils.hyperbolic_ops import LorentzMath
 except ImportError:
-    print("[Error] Could not import LorentzMath!")
+    print("Warning: Could not import LorentzMath. Hyperbolic losses will fail.")
 
-_tokenizer = _Tokenizer()
+def loss_calu(predict, target, config):
+    """Original Euclidean loss for backward compatibility"""
+    loss_fn = CrossEntropyLoss()
+    batch_img, batch_attr, batch_obj, batch_target = target
+    batch_attr = batch_attr.cuda()
+    batch_obj = batch_obj.cuda()
+    batch_target = batch_target.cuda()
+    logits, logits_att, logits_obj, logits_soft_prompt = predict
+    loss_logit_df = loss_fn(logits, batch_target)
+    loss_logit_sp = loss_fn(logits_soft_prompt, batch_target)
+    loss_att = loss_fn(logits_att, batch_attr)
+    loss_obj = loss_fn(logits_obj, batch_obj)
+    loss = loss_logit_df + config.att_obj_w * (loss_att + loss_obj) + config.sp_w * loss_logit_sp
+    return loss
 
-# ==================================================================================
-# Helper: Feature Clipping
-# ==================================================================================
-def clip_norm(x, max_norm=1.0):
-    norm = x.norm(p=2, dim=-1, keepdim=True)
-    target_norm = torch.clamp(norm, max=max_norm)
-    return x * (target_norm / (norm + 1e-6))
+class HyperbolicPrototypicalLoss(nn.Module):
+    """
+    Discriminative Loss in Hyperbolic Space.
+    """
+    def __init__(self):
+        super(HyperbolicPrototypicalLoss, self).__init__()
+        self.loss_fn = nn.CrossEntropyLoss()
 
-# ==================================================================================
-# 1. Basic Components (Kept standard)
-# ==================================================================================
-
-class MLP(nn.Module):
-    def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
-        super(MLP, self).__init__()
-        mod = []
-        incoming = inp_dim
-        for layer_ind in range(num_layers - 1):
-            if len(layers) == 0:
-                outgoing = incoming
-            else:
-                outgoing = layers[layer_ind]
-            mod.append(nn.Linear(incoming, outgoing, bias=bias))
-            incoming = outgoing
-            if norm:
-                mod.append(nn.LayerNorm(outgoing))
-            mod.append(nn.ReLU(inplace=True))
-            if dropout:
-                mod.append(nn.Dropout(p=0.5))
-        mod.append(nn.Linear(incoming, out_dim, bias=bias))
-        if relu:
-            mod.append(nn.ReLU(inplace=True))
-        self.mod = nn.Sequential(*mod)
-
-    def forward(self, x):
-        return self.mod(x)
-
-class MLP_ST(nn.Module):
-    def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
-        super(MLP_ST, self).__init__()
-        mod = []
-        incoming = inp_dim
-        for layer_ind in range(num_layers - 1):
-            if len(layers) == 0:
-                outgoing = incoming
-            else:
-                outgoing = layers[layer_ind]
-            mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
-            incoming = outgoing
-            if norm:
-                mod.append(nn.LayerNorm(outgoing))
-            mod.append(nn.ReLU(inplace=True))
-            if dropout:
-                mod.append(nn.Dropout(p=0.5))
-        mod.append(nn.Conv1d(incoming, out_dim, kernel_size=3, bias=bias, padding=1))
-        if relu:
-            mod.append(nn.ReLU(inplace=True))
-        self.mod = nn.Sequential(*mod)
-
-    def forward(self, x):
-        for o in self.mod:
-            if isinstance(o, nn.LayerNorm):
-                x = x.transpose(1, 2)
-                x = o(x)
-                x = x.transpose(1, 2)
-            else:
-                x = o(x)
-        return x
-
-class TextEncoder(nn.Module):
-    def __init__(self, cfg, clip_model):
-        super().__init__()
-        self.transformer = clip_model.transformer
-        self.ln_final = clip_model.ln_final
-        self.text_projection = clip_model.text_projection
-        full_mask = self.transformer.resblocks[0].attn_mask.clone()
-        self.register_buffer('causal_mask', full_mask)
-        self.dtype = clip_model.dtype
-
-    def forward(self, x, tokenized_prompts):
-        x = x.permute(1, 0, 2)
-        L = x.shape[0] 
-        current_mask = self.causal_mask[:L, :L]
-        for block in self.transformer.resblocks:
-            block.attn_mask = current_mask
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.ln_final(x)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-        return x
-
-class VideoEncoder(nn.Module):
-    def __init__(self, cfg, clip_model):
-        super().__init__()
-        from models.vlm_models.AIM import get_aim
-        self.visual = get_aim(cfg)
-        self.clip_proj = clip_model.visual.proj
-        self.num_frames = cfg.num_frames
-
-    def forward(self, x):
-        out = self.visual(x)
-        if self.clip_proj is not None:
-            out = out @ self.clip_proj
-        out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
-        return out
-
-# ==================================================================================
-# 2. CustomCLIP (Corrected Caching & Dynamic HyCoCLIP Logic)
-# ==================================================================================
-
-class CustomCLIP(nn.Module):
-    def __init__(self, cfg, train_dataset, clip_model):
-        super().__init__()
-        self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
-        self.verb_tokenized_prompts = self.verb_prompt_learner.token_ids
-        self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
-        self.obj_tokenized_prompts = self.obj_prompt_learner.token_ids
-
-        self.text_encoder = TextEncoder(cfg, clip_model)
-        self.video_encoder = VideoEncoder(cfg, clip_model)
+    def forward(self, query_emb, prototype_emb, targets, logit_scale=100.0, c=1.0):
+        q = query_emb.unsqueeze(1)
+        p = prototype_emb.unsqueeze(0)
         
-        # Learnable Curvature
-        self.c_param = nn.Parameter(torch.tensor(1.0))
-
-        # CLIP Logit Scale
-        self.logit_scale = clip_model.logit_scale
-
-        # [HyCoCLIP] Learnable Pre-Scaling Factors
-        # Initialized to -2.3 (approx 0.1 scale) for stability
-        self.visual_alpha = nn.Parameter(torch.tensor(-2.3)) 
-        self.textual_alpha = nn.Parameter(torch.tensor(-2.3))
-
-        try:
-            fc_emb = cfg.fc_emb.split(',')
-        except:
-            fc_emb = [cfg.fc_emb]
-        layers = [int(a) for a in fc_emb]
-
-        # Projection Layers (Trainable!)
-        self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False, norm=True, layers=layers)
-        self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False, norm=True, layers=layers)
-
-        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-
-        self.cached_hierarchy = {} 
-        self.clip_tokenize = clip.tokenize
-        self.token_embedding = clip_model.token_embedding
-        self.positional_embedding = clip_model.positional_embedding
-        self.model_device = next(self.parameters()).device
+        # Calculate Distance with dynamic curvature
+        dists = LorentzMath.hyp_distance(q, p, c=c)
         
-        # [CRITICAL] Apply Identity Initialization
-        self._init_hyperbolic_modules()
-
-    def _init_hyperbolic_modules(self):
-        print("[CustomCLIP] Applying Identity Initialization (Preserving CLIP Alignment)...")
-        for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
-            if isinstance(m, nn.Module):
-                for sub_m in m.modules():
-                    if isinstance(sub_m, nn.Linear):
-                        # Force Identity Init
-                        if sub_m.in_features == sub_m.out_features:
-                            nn.init.eye_(sub_m.weight)
-                            sub_m.weight.data.add_(torch.randn_like(sub_m.weight) * 0.001)
-                        else:
-                            nn.init.orthogonal_(sub_m.weight, gain=1.0)
-                        
-                        if sub_m.bias is not None:
-                            nn.init.constant_(sub_m.bias, 0.0)
-                    
-                    elif isinstance(sub_m, nn.Conv1d):
-                         nn.init.dirac_(sub_m.weight) 
-                         if sub_m.bias is not None:
-                            nn.init.constant_(sub_m.bias, 0.0)
-                            
-                    elif isinstance(sub_m, nn.LayerNorm):
-                        nn.init.constant_(sub_m.bias, 0.0)
-                        nn.init.constant_(sub_m.weight, 1.0)     
-
-    def _encode_plain_text(self, tokenized_prompts):
-        tokenized_prompts = tokenized_prompts.to(self.model_device)
-        x = self.token_embedding(tokenized_prompts).type(self.text_encoder.dtype)
-        x = x + self.positional_embedding.type(self.text_encoder.dtype)
-        # This uses the FROZEN CLIP Text Encoder (Transformer)
-        return self.text_encoder(x, tokenized_prompts)
-
-    def set_hierarchy_prompts(self, coarse_verbs, coarse_objs, pairs):
-        print(f"[CustomCLIP] Setting up hierarchy prompts...")
-        self.coarse_verb_tokens = self.clip_tokenize([f"a photo of {v} something" for v in coarse_verbs])
-        self.coarse_obj_tokens = self.clip_tokenize([f"a photo of something {o}" for o in coarse_objs])
-        pair_texts = [f"a photo of {v} {o}" for v, o in pairs]
-        self.comp_tokens = self.clip_tokenize(pair_texts)
-        print(f"[CustomCLIP] Ready to cache.")
-
-    def _ensure_hierarchy_cached(self, device):
-        # [FIX] We only cache the BACKBONE output (Frozen).
-        # We DO NOT cache the projected features because projection layers are trainable!
-        if "coarse_verb_backbone" in self.cached_hierarchy:
-            return 
-
-        print(f"[CustomCLIP] Caching BACKBONE outputs (Frozen) on {device}...")
-        self.model_device = device
+        # Logits = -distance * scale
+        # [NOTE] This is correct here because we start from raw embeddings
+        logits = -dists * logit_scale
         
-        with torch.no_grad():
-            # 1. Coarse Verbs (Backbone only)
-            cv_backbone = self._encode_plain_text(self.coarse_verb_tokens)
-            self.cached_hierarchy["coarse_verb_backbone"] = cv_backbone.float()
+        return self.loss_fn(logits, targets)
 
-            # 2. Coarse Objects (Backbone only)
-            co_backbone = self._encode_plain_text(self.coarse_obj_tokens)
-            self.cached_hierarchy["coarse_obj_backbone"] = co_backbone.float()
+class EntailmentConeLoss(nn.Module):
+    """
+    Hierarchical Entailment Cone Loss.
+    """
+    def __init__(self, min_radius=0.1, margin=0.01, aperture_scale=1.5):
+        super(EntailmentConeLoss, self).__init__()
+        self.min_radius = min_radius
+        self.margin = margin
+        self.aperture_scale = aperture_scale 
 
-            # 3. Compositions (Backbone only - Batched)
-            batch_size = 500
-            comp_embs = []
-            total = self.comp_tokens.shape[0]
-            for i in range(0, total, batch_size):
-                batch_tokens = self.comp_tokens[i : i + batch_size]
-                emb = self._encode_plain_text(batch_tokens)
-                comp_embs.append(emb.cpu())
-            
-            comp_backbone_all = torch.cat(comp_embs, dim=0).to(device)
-            self.cached_hierarchy["comp_backbone"] = comp_backbone_all.float()
-            
-        print(f"[CustomCLIP] Backbone Cache finished.")
+    def forward(self, child_emb, parent_emb, c=1.0):
+        angle = LorentzMath.oxy_angle(parent_emb, child_emb, c=c)
+        dynamic_aperture = LorentzMath.half_aperture(parent_emb, c=c, min_radius=self.min_radius)
+        target_aperture = self.aperture_scale * dynamic_aperture
+        cone_loss = F.relu(angle - target_aperture + self.margin)
+        return cone_loss.mean()
 
-    def forward(self, video, pairs=None):
-        device = video.device
+class H2EMTotalLoss(nn.Module):
+    """
+    H2EM Paper Eq. (16) Wrapper.
+    """
+    def __init__(self, temperature=None, beta1=1.0, beta2=0.1, beta3=0.5):
+        super(H2EMTotalLoss, self).__init__()
+        self.beta1 = beta1 # DA
+        self.beta2 = beta2 # TE
+        self.beta3 = beta3 # Prim
         
-        if self.coarse_verb_tokens is not None and "coarse_verb_backbone" not in self.cached_hierarchy:
-            self._ensure_hierarchy_cached(device)
+        self.loss_cls = HyperbolicPrototypicalLoss()
+        self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.5)
 
-        # ----------------------------------------------------------------------
-        # 1. Backbone Extraction
-        # ----------------------------------------------------------------------
-        verb_prompts = self.verb_prompt_learner()
-        verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
+    def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
+        # Unpack Features
+        v_feat_hyp = out['v_feat_hyp']
+        o_feat_hyp = out['o_feat_hyp']
+        verb_text_hyp = out['verb_text_hyp']
+        obj_text_hyp = out['obj_text_hyp']
+        coarse_verb_hyp = out['coarse_verb_hyp']
+        coarse_obj_hyp = out['coarse_obj_hyp']
         
-        obj_prompts = self.obj_prompt_learner()
-        obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
+        comp_hyp_v = out['comp_hyp_v'] 
+        comp_hyp_o = out['comp_hyp_o'] 
+        
+        # Unpack Logits (ALREADY SCALED from custom_clip_c2c.py)
+        verb_logits = out['verb_logits']
+        obj_logits = out['obj_logits']
+        
+        # Scale & Curvature
+        logit_scale = out['logit_scale']
+        current_c = out['curvature']
 
-        video_features = self.video_encoder(video)
+        # A. Primitive Auxiliary (L_s + L_o)
+        # This uses embeddings, so it calculates distance and scales internally. Correct.
+        L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb, logit_scale, c=current_c)
+        L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj, logit_scale, c=current_c)
+        L_prim = L_s + L_o
 
-        # ----------------------------------------------------------------------
-        # 2. Hyperbolic Operations (Dynamic Projection)
-        # ----------------------------------------------------------------------
-        with torch.cuda.amp.autocast(enabled=False):
-            
-            current_c = (F.softplus(self.c_param) + 1e-5).float()
-            verb_text_features = verb_text_features.float()
-            obj_text_features = obj_text_features.float()
-            video_features = video_features.float()
+        # B. Discriminative Alignment (L_DA)
+        # [CRITICAL FIX] REMOVED '* logit_scale'
+        # Because verb_logits/obj_logits are already scaled in the model forward pass.
+        pair_logits = verb_logits[:, p2v_map] + obj_logits[:, p2o_map]
+        L_DA = F.cross_entropy(pair_logits, batch_target)
 
-            # [A] Project Fine-grained Concepts (Trainable c2c layers)
-            verb_text_features = self.c2c_text_v(verb_text_features)
-            obj_text_features = self.c2c_text_o(obj_text_features)
-            o_feat = self.c2c_OE1(video_features.mean(dim=-1))
-            v_feat_t = self.c2c_VE1(video_features)
-            v_feat = v_feat_t.mean(dim=-1)
+        # C. Taxonomic Entailment (L_TE)
+        loss_h1 = self.loss_cone(child_emb=verb_text_hyp, parent_emb=coarse_verb_hyp[v2cv_map], c=current_c)
+        loss_h2 = self.loss_cone(child_emb=obj_text_hyp, parent_emb=coarse_obj_hyp[o2co_map], c=current_c)
+        loss_h3 = self.loss_cone(child_emb=comp_hyp_v, parent_emb=verb_text_hyp[p2v_map], c=current_c)
+        loss_h4 = self.loss_cone(child_emb=comp_hyp_o, parent_emb=obj_text_hyp[p2o_map], c=current_c)
+        
+        L_TE = loss_h1 + loss_h2 + loss_h3 + loss_h4
 
-            # [B] Project Hierarchy Concepts (From Cached Backbone -> Trainable c2c)
-            # This allows gradients to update c2c layers based on Hierarchy Loss!
-            cv_backbone = self.cached_hierarchy["coarse_verb_backbone"]
-            co_backbone = self.cached_hierarchy["coarse_obj_backbone"]
-            comp_backbone = self.cached_hierarchy["comp_backbone"]
-
-            cv_euc = self.c2c_text_v(cv_backbone)
-            co_euc = self.c2c_text_o(co_backbone)
-            
-            # Compositions need to be projected to both spaces
-            comp_v_euc = self.c2c_text_v(comp_backbone)
-            comp_o_euc = self.c2c_text_o(comp_backbone)
-
-            # [C] Dynamic Scaling (HyCoCLIP Style)
-            v_scale = self.visual_alpha.exp()
-            t_scale = self.textual_alpha.exp()
-            
-            # Normalize and Scale (All features)
-            verb_text_features = F.normalize(verb_text_features, p=2, dim=-1) * t_scale
-            obj_text_features = F.normalize(obj_text_features, p=2, dim=-1) * t_scale
-            o_feat = F.normalize(o_feat, p=2, dim=-1) * v_scale
-            v_feat = F.normalize(v_feat, p=2, dim=-1) * v_scale
-
-            cv_euc = F.normalize(cv_euc, p=2, dim=-1) * t_scale
-            co_euc = F.normalize(co_euc, p=2, dim=-1) * t_scale
-            comp_v_euc = F.normalize(comp_v_euc, p=2, dim=-1) * t_scale
-            comp_o_euc = F.normalize(comp_o_euc, p=2, dim=-1) * t_scale
-
-            # [D] Map to Hyperbolic
-            verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
-            obj_text_hyp = LorentzMath.exp_map_0(obj_text_features, c=current_c)
-            o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
-            v_feat_hyp = LorentzMath.exp_map_0(v_feat, c=current_c)
-
-            coarse_verb_hyp = LorentzMath.exp_map_0(cv_euc, c=current_c)
-            coarse_obj_hyp  = LorentzMath.exp_map_0(co_euc, c=current_c)
-            comp_hyp_v = LorentzMath.exp_map_0(comp_v_euc, c=current_c)
-            comp_hyp_o = LorentzMath.exp_map_0(comp_o_euc, c=current_c)
-
-            # [E] Distances
-            dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
-            dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
-            
-            # Logit Scale
-            with torch.no_grad():
-                self.logit_scale.clamp_(max=4.6052)
-            logit_scale = self.logit_scale.exp()
-            
-            verb_logits = -dist_v 
-            obj_logits = -dist_o
-
-            if self.training:
-                return {
-                    "verb_logits": verb_logits,
-                    "obj_logits": obj_logits,
-                    "v_feat_hyp": v_feat_hyp,
-                    "o_feat_hyp": o_feat_hyp,
-                    "verb_text_hyp": verb_text_hyp,
-                    "obj_text_hyp": obj_text_hyp,
-                    "coarse_verb_hyp": coarse_verb_hyp,
-                    "coarse_obj_hyp": coarse_obj_hyp,
-                    "comp_hyp_v": comp_hyp_v,  
-                    "comp_hyp_o": comp_hyp_o,
-                    "logit_scale": logit_scale,
-                    "curvature": current_c  
-                }
-            else:
-                if pairs is not None:
-                    verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                    combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
-                    return combined_logits * logit_scale
-                else:
-                    return verb_logits * logit_scale, obj_logits * logit_scale
-
-# ==================================================================================
-# 3. GLOBAL Helpers (Standard)
-# ==================================================================================
-
-def load_clip_to_cpu(cfg):
-    backbone_name = cfg.backbone
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url)
-    try:
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
-    model = clip.build_model(state_dict or model.state_dict())
-    return model
-
-def build_model(train_dataset, cfg):
-    print(f"Loading CLIP (backbone: {cfg.backbone})")
-    clip_model = load_clip_to_cpu(cfg)
-    clip_model.float()
-    print("Building custom CLIP (Hyperbolic Version)")
-    model = CustomCLIP(cfg, train_dataset, clip_model)
-    # Ensure new parameters are trainable
-    for name, param in model.named_parameters():
-        param.requires_grad_(False)
-        if "prompt_learner" in name and cfg.learn_input_method != 'zero':
-            param.requires_grad_(True)
-        elif 'video_encoder' in name:
-            if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
-                param.requires_grad = True
-        elif 'c2c' in name:
-            param.requires_grad = True
-        elif 'c_param' in name:
-            param.requires_grad = True
-        elif 'visual_alpha' in name or 'textual_alpha' in name:
-            param.requires_grad = True
-    return model
+        # Total Loss
+        loss = self.beta1 * L_DA + self.beta2 * L_TE + self.beta3 * L_prim
+        
+        return loss, {
+            "Total": loss.item(),
+            "Prim": L_prim.item(),
+            "DA": L_DA.item(),
+            "TE": L_TE.item(),
+            "Curvature": current_c.item()
+        }
