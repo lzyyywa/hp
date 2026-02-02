@@ -13,7 +13,6 @@ from loss import H2EMTotalLoss
 from utils.hierarchy_helper import HierarchyHelper
 
 def cal_conditional(attr2idx, obj2idx, set_name, daset):
-    # (Original logic kept unchanged)
     def load_split(path):
         with open(path, 'r') as f:
             loaded_data = json.load(f)
@@ -41,7 +40,6 @@ def cal_conditional(attr2idx, obj2idx, set_name, daset):
     return v_o_on_v, v_o_on_o
 
 def evaluate(model, dataset, config):
-    # (Original logic kept unchanged)
     model.eval()
     evaluator = test.Evaluator(dataset, model=None)
     all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = test.predict_logits(
@@ -72,7 +70,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # [STEP 1] Initialize Hierarchy Helper
     # =========================================================================
     print("[Train] Initializing Hierarchy Helper...")
-    helper = HierarchyHelper(train_dataset, root_dir='dataset') # Ensure correct path
+    helper = HierarchyHelper(train_dataset, root_dir='dataset') 
     
     # Inject text information into the model
     coarse_verbs, coarse_objs = helper.get_coarse_info()
@@ -90,7 +88,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # =========================================================================
     # [STEP 2] Instantiate the Encapsulated Loss
     # =========================================================================
-    # Beta2=0.1 is acceptable now because we use DYNAMIC APERTURE in loss.py
     criterion = H2EMTotalLoss(temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5).cuda()
     
     train_dataloader = DataLoader(
@@ -114,9 +111,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
-         
-        
-
+          
         for bid, batch in enumerate(train_dataloader):
             batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
@@ -124,48 +119,44 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_target = batch[3].cuda()
 
             # ==================================================================================
-            # [HyCoCLIP STRATEGY] 
-            # 1. Use AMP for Backbone (ViT/ResNet) for efficiency.
-            # 2. The model.forward() handles switching to Float32 for Hyperbolic Ops internally.
-            # 3. If you still see NaN, verify custom_clip_c2c.py has 'autocast(enabled=False)'
+            # [HyCoCLIP Strategy Implementation] 
+            # 1. Use AMP for Backbone logic
+            # 2. Force Loss Calculation in Float32 to avoid NaN in Hyperbolic Ops
             # ==================================================================================
 
-            # [DEBUG MODE]: To disable AMP completely (Pure Float32), comment out the 'with' line below
-            # and un-indent the code block inside it.
+            # [A] Forward Pass (Auto-Mixed Precision)
             with torch.cuda.amp.autocast(enabled=True): 
-                # Model output is GUARANTEED to be Float32 if custom_clip_c2c.py is updated correctly
+                # custom_clip_c2c.py handles switching to float32 internally for hyperbolic parts
+                # but we keep this context for the visual encoder backbone.
                 out = model(batch_img)
-                
-                # Calculate Loss (Inputs are Float32, so calculation stays in Float32)
+            
+            # [B] Loss Calculation (Strictly Float32)
+            # We move this OUTSIDE autocast to prevent any accidental downcasting 
+            # of the hyperbolic distances before loss computation.
             loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
-                                          p2v, p2o, v2cv, o2co)
+                                        p2v, p2o, v2cv, o2co)
                 
             loss = loss / config.gradient_accumulation_steps
 
-            # 3. Backward propagation
-            # [DEBUG MODE]: If disabling AMP, comment out 'scaler.scale(loss).backward()'
-            # and uncomment 'loss.backward()' below.
+            # [C] Backward Pass
             scaler.scale(loss).backward()
-            # loss.backward() # [Uncomment this for Pure Float32 Debug]
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
-                # [DEBUG MODE]: If disabling AMP, comment out scaler lines and use optimizer.step() directly.
+                # Unscale before clipping
                 scaler.unscale_(optimizer)
                 
-                # Gradient Clipping is good practice for Hyperbolic Networks
+                # [Critical] Gradient Clipping for Hyperbolic stability
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
-                # optimizer.step() # [Uncomment this for Pure Float32 Debug]
-                
                 optimizer.zero_grad()
 
-            # 4. Record loss values
+            # Record loss values
             for k, v in loss_dict.items():
-              if k not in loss_meters:
-                  loss_meters[k] = []
-              loss_meters[k].append(v)
+                if k not in loss_meters:
+                    loss_meters[k] = []
+                loss_meters[k].append(v)
 
             progress_bar.set_postfix({
                 "Total": f"{np.mean(loss_meters['Total'][-50:]):.3f}",
@@ -224,7 +215,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 torch.save(model.state_dict(), os.path.join(config.save_path, "best.pt"))
                 print("Evaluating test dataset:")
                 _, test_result = evaluate(model, test_dataset, config)
-                # (Optional) Log test result for best model if needed
 
         log_training.flush()
 
