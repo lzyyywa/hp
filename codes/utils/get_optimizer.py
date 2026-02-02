@@ -1,4 +1,5 @@
 import torch
+
 def get_optimizer_vm(cfg,model):
     comp_param=[]
     video_en_param=[]
@@ -10,7 +11,7 @@ def get_optimizer_vm(cfg,model):
     optimizer = torch.optim.Adam([
         {'params': comp_param, 'lr': cfg.com_lr,'weight_decay': cfg.com_wd},
         {'params': video_en_param, 'lr': cfg.ve_lr,'weight_decay': cfg.ve_wd}],
-        lr=cfg.ve_lr, eps=1e-8,weight_decay=cfg.ve_wd)  # Params used from paper, the lr is smaller, more safe for fine tuning to new dataset
+        lr=cfg.ve_lr, eps=1e-8,weight_decay=cfg.ve_wd)  
 
     return optimizer
 
@@ -21,12 +22,24 @@ def get_optimizer_vlm(cfg,model):
     prompt_param = []
     c2c_with_wd=[]
     c2c_no_wd = []
+    
+    # [NEW] 专门存放 Alpha 参数的列表
+    hyperbolic_params = [] 
+
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue 
+            
         if 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name:
                 vision_no_wd.append(param)
             elif 'Adapter' in name or 'clip_proj' in name:
                 vision_with_wd.append(param)
+        
+        # [NEW] 捕获 visual_alpha 和 textual_alpha
+        elif 'visual_alpha' in name or 'textual_alpha' in name:
+            hyperbolic_params.append(param)
+            
     if cfg.text_encoding_manner=='composition':
         for name, param in model.named_parameters():
             if 'dfsp' in name:
@@ -36,7 +49,8 @@ def get_optimizer_vlm(cfg,model):
             {'params': vision_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},
             {'params': vision_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0}, ],
             betas=(0.9, 0.999), lr=cfg.visual_lr, eps=1e-8,
-            weight_decay=cfg.visual_wd)  # Params used from paper, the lr is
+            weight_decay=cfg.visual_wd)
+            
     elif cfg.text_encoding_manner=='component':
         for name, param in model.verb_prompt_learner.named_parameters():
             prompt_param.append(param)
@@ -48,20 +62,21 @@ def get_optimizer_vlm(cfg,model):
                 c2c_with_wd.append(param)
             if 'c_param' in name:
                 c2c_no_wd.append(param)
+        
         optimizer = torch.optim.AdamW([
             {'params':  prompt_param, 'lr': cfg.text_lr, 'weight_decay': cfg.text_wd},
             {'params': vision_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},
             {'params': vision_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0},
-
             {'params': c2c_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},
-            {'params': c2c_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0},],
+            {'params': c2c_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0},
+            # [NEW] 把 Alpha 加入优化器，使用 visual_lr
+            {'params': hyperbolic_params, 'lr': cfg.visual_lr, 'weight_decay': 0.0}, 
+            ],
             betas=(0.9, 0.999), lr=cfg.visual_lr, eps=1e-8,
-            weight_decay=cfg.visual_wd)  # Params used from paper, the lr is
+            weight_decay=cfg.visual_wd)
     else:
         raise NotImplementedError
     return optimizer
-
-
 
 def get_optimizer(cfg,model):
     if cfg.framework=='vm':
