@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch
 import numpy as np
 
-# Import the upgraded hyperbolic operations
+# [HyCoCLIP Alignment] Import correct ops
 try:
     from utils.hyperbolic_ops import LorentzMath
 except ImportError:
@@ -26,7 +26,7 @@ def loss_calu(predict, target, config):
     return loss
 
 # =========================================================================
-# Hyperbolic Losses (Fixed Logic)
+# Hyperbolic Losses (Strict HyCoCLIP Logic)
 # =========================================================================
 
 class HyperbolicPrototypicalLoss(nn.Module):
@@ -38,21 +38,23 @@ class HyperbolicPrototypicalLoss(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, query_emb, prototype_emb, targets, logit_scale=100.0, c=1.0):
-        q = query_emb.unsqueeze(1)
-        p = prototype_emb.unsqueeze(0)
+        # query: [B, D], prototype: [N, D]
+        q = query_emb.unsqueeze(1) # [B, 1, D]
+        p = prototype_emb.unsqueeze(0) # [1, N, D]
         
-        # Calculate Distance with dynamic curvature
+        # Calculate Hyperbolic Distance
         dists = LorentzMath.hyp_distance(q, p, c=c)
         
         # Logits = -distance * scale
-        # [NOTE] This is correct here because we start from raw embeddings
+        # [Correct] We compute logits from scratch here using embeddings.
         logits = -dists * logit_scale
         
         return self.loss_fn(logits, targets)
 
 class EntailmentConeLoss(nn.Module):
     """
-    Hierarchical Entailment Cone Loss.
+    Hierarchical Entailment Cone Loss (HyCoCLIP Style).
+    Enforces that 'child' is within the cone of 'parent'.
     """
     def __init__(self, min_radius=0.1, margin=0.01, aperture_scale=1.5):
         super(EntailmentConeLoss, self).__init__()
@@ -61,10 +63,19 @@ class EntailmentConeLoss(nn.Module):
         self.aperture_scale = aperture_scale 
 
     def forward(self, child_emb, parent_emb, c=1.0):
+        # [HyCoCLIP Logic] Angle calculation
         angle = LorentzMath.oxy_angle(parent_emb, child_emb, c=c)
+        
+        # [HyCoCLIP Logic] Aperture calculation
         dynamic_aperture = LorentzMath.half_aperture(parent_emb, c=c, min_radius=self.min_radius)
+        
+        # Scale aperture (Optional hyperparam from your method)
         target_aperture = self.aperture_scale * dynamic_aperture
-        cone_loss = F.relu(angle - target_aperture + self.margin)
+        
+        # Violation: angle > aperture
+        # Loss = max(0, angle - aperture + margin)
+        cone_loss = torch.clamp(angle - target_aperture + self.margin, min=0.0)
+        
         return cone_loss.mean()
 
 class H2EMTotalLoss(nn.Module):
@@ -73,15 +84,15 @@ class H2EMTotalLoss(nn.Module):
     """
     def __init__(self, temperature=None, beta1=1.0, beta2=0.1, beta3=0.5):
         super(H2EMTotalLoss, self).__init__()
-        self.beta1 = beta1 # DA
-        self.beta2 = beta2 # TE
-        self.beta3 = beta3 # Prim
+        self.beta1 = beta1 # Weight for DA (Discriminative Alignment)
+        self.beta2 = beta2 # Weight for TE (Taxonomic Entailment)
+        self.beta3 = beta3 # Weight for Prim (Primitive Auxiliary)
         
         self.loss_cls = HyperbolicPrototypicalLoss()
         self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.5)
 
     def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
-        # Unpack Features
+        # 1. Unpack Features
         v_feat_hyp = out['v_feat_hyp']
         o_feat_hyp = out['o_feat_hyp']
         verb_text_hyp = out['verb_text_hyp']
@@ -92,27 +103,34 @@ class H2EMTotalLoss(nn.Module):
         comp_hyp_v = out['comp_hyp_v'] 
         comp_hyp_o = out['comp_hyp_o'] 
         
-        # Unpack Logits (ALREADY SCALED from custom_clip_c2c.py)
+        # 2. Unpack Pre-Calculated Logits (Already Scaled in Model)
         verb_logits = out['verb_logits']
         obj_logits = out['obj_logits']
         
-        # Scale & Curvature
+        # 3. Get Scale & Curvature
         logit_scale = out['logit_scale']
         current_c = out['curvature']
 
-        # A. Primitive Auxiliary (L_s + L_o)
-        # This uses embeddings, so it calculates distance and scales internally. Correct.
+        # ---------------------------------------------------------------------
+        # A. Primitive Auxiliary Loss (L_s + L_o)
+        # ---------------------------------------------------------------------
+        # Uses embeddings directly, so we pass logit_scale to compute scaled logits inside.
         L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb, logit_scale, c=current_c)
         L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj, logit_scale, c=current_c)
         L_prim = L_s + L_o
 
-        # B. Discriminative Alignment (L_DA)
-        # [CRITICAL FIX] REMOVED '* logit_scale'
-        # Because verb_logits/obj_logits are already scaled in the model forward pass.
+        # ---------------------------------------------------------------------
+        # B. Discriminative Alignment Loss (L_DA)
+        # ---------------------------------------------------------------------
+        # [CRITICAL CHECK] verb_logits and obj_logits are ALREADY scaled in model.forward().
+        # So we just sum them and pass to CrossEntropy. DO NOT multiply by logit_scale again.
         pair_logits = verb_logits[:, p2v_map] + obj_logits[:, p2o_map]
         L_DA = F.cross_entropy(pair_logits, batch_target)
 
-        # C. Taxonomic Entailment (L_TE)
+        # ---------------------------------------------------------------------
+        # C. Taxonomic Entailment Loss (L_TE)
+        # ---------------------------------------------------------------------
+        # Checks 4 hierarchical relationships
         loss_h1 = self.loss_cone(child_emb=verb_text_hyp, parent_emb=coarse_verb_hyp[v2cv_map], c=current_c)
         loss_h2 = self.loss_cone(child_emb=obj_text_hyp, parent_emb=coarse_obj_hyp[o2co_map], c=current_c)
         loss_h3 = self.loss_cone(child_emb=comp_hyp_v, parent_emb=verb_text_hyp[p2v_map], c=current_c)
@@ -132,13 +150,12 @@ class H2EMTotalLoss(nn.Module):
         }
 
 # =========================================================================
-# Legacy Losses (Restore these to fix ImportError)
+# Legacy Losses (Preserved for compatibility)
 # =========================================================================
 
 class KLLoss(nn.Module):
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
         super().__init__()
-        # print('=========using KL Loss=and has temperature and * bz==========')
         self.error_metric = error_metric
     def forward(self, prediction, label,mul=False):
         batch_size = prediction.shape[0]
