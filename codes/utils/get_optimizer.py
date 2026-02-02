@@ -23,21 +23,25 @@ def get_optimizer_vlm(cfg,model):
     c2c_with_wd=[]
     c2c_no_wd = []
     
-    # [NEW] 专门存放 Alpha 参数的列表
+    # [HyCoCLIP Alignment] Hyperbolic Scalars (Alpha, Curvature, Scale)
+    # These MUST have 0 weight decay to prevent collapsing to 0.
     hyperbolic_params = [] 
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue 
             
+        # 1. Vision Encoder Params
         if 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name:
                 vision_no_wd.append(param)
             elif 'Adapter' in name or 'clip_proj' in name:
                 vision_with_wd.append(param)
         
-        # [NEW] 捕获 visual_alpha 和 textual_alpha
-        elif 'visual_alpha' in name or 'textual_alpha' in name:
+        # 2. Hyperbolic Scalars (CRITICAL FIX)
+        # Catch: visual_alpha, textual_alpha, c_param (curvature), logit_scale
+        # These are all scalars that control geometry.
+        elif 'visual_alpha' in name or 'textual_alpha' in name or 'c_param' in name or 'logit_scale' in name:
             hyperbolic_params.append(param)
             
     if cfg.text_encoding_manner=='composition':
@@ -52,24 +56,29 @@ def get_optimizer_vlm(cfg,model):
             weight_decay=cfg.visual_wd)
             
     elif cfg.text_encoding_manner=='component':
+        # 3. Text Encoder / Prompt Params
         for name, param in model.verb_prompt_learner.named_parameters():
             prompt_param.append(param)
         for name, param in model.obj_prompt_learner.named_parameters():
             if 'token_embedding' not in name:
                 prompt_param.append(param)
+        
+        # 4. C2C Projection Layers (MLP)
         for name, param in model.named_parameters():
             if 'c2c' in name:
                 c2c_with_wd.append(param)
-            if 'c_param' in name:
-                c2c_no_wd.append(param)
+            # Note: c_param is now handled in hyperbolic_params, so we don't add it to c2c_no_wd
         
         optimizer = torch.optim.AdamW([
             {'params':  prompt_param, 'lr': cfg.text_lr, 'weight_decay': cfg.text_wd},
             {'params': vision_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},
             {'params': vision_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0},
+            
+            # C2C Layers
             {'params': c2c_with_wd, 'lr': cfg.visual_lr, 'weight_decay': cfg.visual_wd},
             {'params': c2c_no_wd, 'lr': cfg.visual_lr, 'weight_decay': 0.0},
-            # [NEW] 把 Alpha 加入优化器，使用 visual_lr
+            
+            # [HyCoCLIP Group] Scalars with visual_lr and NO weight decay
             {'params': hyperbolic_params, 'lr': cfg.visual_lr, 'weight_decay': 0.0}, 
             ],
             betas=(0.9, 0.999), lr=cfg.visual_lr, eps=1e-8,
