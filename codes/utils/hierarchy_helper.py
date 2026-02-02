@@ -21,6 +21,7 @@ class HierarchyHelper:
         self.obj_map_raw = self._load_json('object_mapping.json')
 
         # 2. Get basic fine-grained lists from Dataset
+        # Ensure your dataset class exposes these attributes!
         self.verbs = dataset.attrs
         self.objs = dataset.objs
         self.pairs = dataset.pairs 
@@ -33,9 +34,12 @@ class HierarchyHelper:
         print(f"[HierarchyHelper] Loaded {len(self.coarse_verbs)} coarse verbs and {len(self.coarse_objs)} coarse objects.")
 
         # 4. Build index mapping Tensors (STRICT BUILD)
+        # v2cv: Map Fine-Verb-ID -> Coarse-Verb-ID
         self.v2cv_idx = self._build_mapping(self.verbs, self.verb_map_raw, self.coarse_verbs, "Verb")
+        # o2co: Map Fine-Obj-ID -> Coarse-Obj-ID
         self.o2co_idx = self._build_mapping(self.objs, self.obj_map_raw, self.coarse_objs, "Object")
         
+        # p2v, p2o: Map Pair-ID -> Verb-ID / Obj-ID
         self.p2v_idx, self.p2o_idx = self._build_pair_mapping()
 
     def _load_json(self, filename):
@@ -81,6 +85,7 @@ class HierarchyHelper:
     def _build_pair_mapping(self):
         """
         Build Composition (Pair) to Verb and Object index mappings.
+        Used for L_DA (summing independent logits) and L_TE (checking composition entailment).
         """
         verb_to_id = {v: i for i, v in enumerate(self.verbs)}
         obj_to_id = {o: i for i, o in enumerate(self.objs)}
@@ -95,7 +100,9 @@ class HierarchyHelper:
         return p2v, p2o
 
     def get_coarse_info(self):
+        """Returns the lists of coarse concepts for Prompt Learner initialization"""
         return self.coarse_verbs, self.coarse_objs
 
     def get_mappings(self):
+        """Returns the Index Tensors for Loss calculation"""
         return self.v2cv_idx, self.o2co_idx, self.p2v_idx, self.p2o_idx
