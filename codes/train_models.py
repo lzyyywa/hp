@@ -7,7 +7,7 @@ import torch
 from torch.utils.data.dataloader import DataLoader
 import torch.nn.functional as F
 
-import test as test
+import test  # [Fix] Clean import
 # [IMPORT] Import the upgraded Loss and Helper
 from loss import H2EMTotalLoss
 from utils.hierarchy_helper import HierarchyHelper
@@ -138,6 +138,13 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
             loss = loss / config.gradient_accumulation_steps
 
+            # [Safety Check] NaN Loss Skip (CRITICAL for Hyperbolic Training)
+            # If loss is NaN, we must SKIP this step to avoid poisoning the model weights.
+            if torch.isnan(loss):
+                print(f"[Warning] NaN loss detected at epoch {i+1}, batch {bid}. Skipping step.")
+                optimizer.zero_grad()
+                continue
+
             # [C] Backward Pass
             scaler.scale(loss).backward()
 
@@ -146,6 +153,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 scaler.unscale_(optimizer)
                 
                 # [Critical] Gradient Clipping for Hyperbolic stability
+                # Ensures gradients don't explode near the boundary of the Poincare ball
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
@@ -156,10 +164,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             for k, v in loss_dict.items():
                 if k not in loss_meters:
                     loss_meters[k] = []
-                loss_meters[k].append(v)
+                # Only record valid losses
+                if not torch.isnan(v) and not torch.isinf(v):
+                    loss_meters[k].append(v.item() if isinstance(v, torch.Tensor) else v)
 
             progress_bar.set_postfix({
-                "Total": f"{np.mean(loss_meters['Total'][-50:]):.3f}",
+                "Total": f"{np.mean(loss_meters['Total'][-50:]) if loss_meters['Total'] else 0:.3f}",
                 "DA":    f"{loss_dict['DA']:.3f}",
                 "Prim":  f"{loss_dict['Prim']:.3f}",
                 "TE":    f"{loss_dict['TE']:.3f}"
@@ -170,7 +180,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         progress_bar.close()
         
         # Epoch Summary
-        avgs = {k: np.mean(v) for k, v in loss_meters.items()}
+        avgs = {k: np.mean(v) if v else 0.0 for k, v in loss_meters.items()}
         print(f"Epoch {i+1} | Total: {avgs['Total']:.4f} | Prim: {avgs['Prim']:.4f} | DA: {avgs['DA']:.4f} | TE: {avgs['TE']:.4f}")
         
         log_training.write(f"\nEpoch {i+1}\n")
