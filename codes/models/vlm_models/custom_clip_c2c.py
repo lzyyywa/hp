@@ -11,12 +11,17 @@ import math
 try:
     from utils.hyperbolic_ops import LorentzMath
 except ImportError:
-    print("[Error] Could not import LorentzMath!")
+    print("[Error] Could not import LorentzMath! Please check your path.")
+    exit(1)
 
 _tokenizer = _Tokenizer()
 
-def clip_norm(x, max_norm=1.0):
+# [修正 1] 改进的模长截断函数
+# 允许模长在 [0, max_norm] 之间变化，保留层级信息（模长代表离根节点的距离）
+# 只有当模长超过 max_norm 时才进行缩放，而不是强制归一化
+def clip_norm(x, max_norm=5.0):
     norm = x.norm(p=2, dim=-1, keepdim=True)
+    # 仅在 norm > max_norm 时生效，否则保持原样
     target_norm = torch.clamp(norm, max=max_norm)
     return x * (target_norm / (norm + 1e-6))
 
@@ -127,28 +132,26 @@ class CustomCLIP(nn.Module):
         
         # ---------------------------------------------------------------------
         # [HyCoCLIP Alignment 1] Curvature Initialization
-        # Reference: hycoclip/models.py lines 155-160
-        # "Initialize curvature parameter. Hyperboloid curvature will be -curv."
-        # Init to 1.0 (log space = 0.0)
         # ---------------------------------------------------------------------
         self.c_param = nn.Parameter(torch.tensor(1.0).log())
         
         # Constraints for curvature learning
         self._curv_minmax = {
-            "max": math.log(1.0 * 10), # log(10) ≈ 2.3
-            "min": math.log(1.0 / 10), # log(0.1) ≈ -2.3
+            "max": math.log(1.0 * 10), 
+            "min": math.log(1.0 / 10), 
         }
 
         # CLIP Logit Scale (learnable)
         self.logit_scale = clip_model.logit_scale
 
         # ---------------------------------------------------------------------
-        # [HyCoCLIP Alignment 2] Alpha (Scale) Initialization
-        # Reference: hycoclip/models.py lines 167-169
-        # "Learnable scalars to ensure that image/text features have an expected unit norm"
-        # CRITICAL: Init to log(1 / sqrt(dim)). For dim=512, scale ~= 0.044
+        # [修正 2] Alpha (Scale) Initialization
+        # 之前的值 (dim**-0.5 ≈ 0.044) 太小，导致所有点塌缩在原点，梯度消失/不稳定。
+        # 修正为 0.5，确保初始状态下点在双曲空间有一定分布。
         # ---------------------------------------------------------------------
-        init_scale = float(cfg.emb_dim) ** -0.5
+        # init_scale = float(cfg.emb_dim) ** -0.5  <-- 导致问题的旧代码
+        init_scale = 0.5 
+        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_scale} (Log space)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_scale).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_scale).log())
 
@@ -173,7 +176,7 @@ class CustomCLIP(nn.Module):
         self.positional_embedding = clip_model.positional_embedding
         self.model_device = next(self.parameters()).device
         
-        # Apply strict identity init as per your previous requirement
+        # Apply strict identity init
         self._init_hyperbolic_modules()
 
     def _init_hyperbolic_modules(self):
@@ -195,7 +198,7 @@ class CustomCLIP(nn.Module):
                             nn.init.constant_(sub_m.bias, 0.0)
                     elif isinstance(sub_m, nn.LayerNorm):
                         nn.init.constant_(sub_m.bias, 0.0)
-                        nn.init.constant_(sub_m.weight, 1.0)     
+                        nn.init.constant_(sub_m.weight, 1.0)      
 
     def _encode_plain_text(self, tokenized_prompts):
         tokenized_prompts = tokenized_prompts.to(self.model_device)
@@ -256,13 +259,13 @@ class CustomCLIP(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             # -----------------------------------------------------------------
             # [HyCoCLIP Alignment 3] Clamping Logic
-            # Reference: hycoclip/models.py lines 208-215
             # -----------------------------------------------------------------
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
-            current_c = self.c_param.exp() # Use exp(), not softplus
+            current_c = self.c_param.exp() 
             
-            self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
-            self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+            # Alpha 必须是正数，这里通常不做 max 限制，或者 max=0.0 (Scale=1.0)
+            self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=2.0) 
+            self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=2.0)
             
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
@@ -285,23 +288,23 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
-            # [HyCoCLIP Alignment 4] Scaling
-            # Scale Euclidean features BEFORE mapping.
-            # HyCoCLIP does not explicitly normalize before scaling in `encode_image` if `project=False`
-            # BUT we assume CLIP features are roughly normalized. 
-            # Safe bet: Normalize to unit ball, then scale by `exp(alpha)` (which is small, ~0.044)
+            # [修正 3] 模长处理 (Geometry Preservation)
+            # 原错误: F.normalize(...) 导致层级丢失。
+            # 修正: 使用 clip_norm 允许模长变化，并乘以前端的 scale 参数。
+            
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
-            verb_text_features = F.normalize(verb_text_features, p=2, dim=-1) * t_scale
-            obj_text_features = F.normalize(obj_text_features, p=2, dim=-1) * t_scale
-            o_feat = F.normalize(o_feat, p=2, dim=-1) * v_scale
-            v_feat = F.normalize(v_feat, p=2, dim=-1) * v_scale
+            # 使用 clip_norm 代替 F.normalize，max_norm 设为 5.0 以容纳层级结构
+            verb_text_features = clip_norm(verb_text_features, max_norm=5.0) * t_scale
+            obj_text_features = clip_norm(obj_text_features, max_norm=5.0) * t_scale
+            o_feat = clip_norm(o_feat, max_norm=5.0) * v_scale
+            v_feat = clip_norm(v_feat, max_norm=5.0) * v_scale
 
-            cv_euc = F.normalize(cv_euc, p=2, dim=-1) * t_scale
-            co_euc = F.normalize(co_euc, p=2, dim=-1) * t_scale
-            comp_v_euc = F.normalize(comp_v_euc, p=2, dim=-1) * t_scale
-            comp_o_euc = F.normalize(comp_o_euc, p=2, dim=-1) * t_scale
+            cv_euc = clip_norm(cv_euc, max_norm=5.0) * t_scale
+            co_euc = clip_norm(co_euc, max_norm=5.0) * t_scale
+            comp_v_euc = clip_norm(comp_v_euc, max_norm=5.0) * t_scale
+            comp_o_euc = clip_norm(comp_o_euc, max_norm=5.0) * t_scale
 
             # [D] Map to Hyperbolic (ExpMap0)
             verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
@@ -315,6 +318,7 @@ class CustomCLIP(nn.Module):
             comp_hyp_o = LorentzMath.exp_map_0(comp_o_euc, c=current_c)
 
             # [E] Distances
+            # 注意: hyp_distance 内部已经有 clamp，这里直接调用即可
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
@@ -345,6 +349,8 @@ class CustomCLIP(nn.Module):
             else:
                 if pairs is not None:
                     verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
+                    # CRITICAL: Hyperbolic fusion MUST be ADDITIVE in logit space (negative distance).
+                    # DO NOT CHANGE TO MULTIPLICATION.
                     combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
                     return combined_logits 
                 else:
@@ -366,7 +372,7 @@ def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Hyperbolic Version - HyCoCLIP Init Aligned)")
+    print("Building custom CLIP (Hyperbolic Version - Fixed)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     for name, param in model.named_parameters():
         param.requires_grad_(False)
