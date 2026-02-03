@@ -1,5 +1,6 @@
 import random
 import os
+import numpy as np
 import pprint
 from opts import parser
 from models.compositional_models import get_model
