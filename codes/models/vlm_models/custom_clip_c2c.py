@@ -16,10 +16,8 @@ except ImportError:
 
 _tokenizer = _Tokenizer()
 
-def clip_norm(x, max_norm=5.0):
-    norm = x.norm(p=2, dim=-1, keepdim=True)
-    target_norm = torch.clamp(norm, max=max_norm)
-    return x * (target_norm / (norm + 1e-6))
+# [修正 1] 删除手动 clip_norm 函数
+# 我们将完全依赖 Alpha Scaling (软缩放) 来控制模长
 
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -31,14 +29,20 @@ class MLP(nn.Module):
                 outgoing = incoming
             else:
                 outgoing = layers[layer_ind]
+            
+            # [修正 4] 确保所有层都使用传入的 bias 参数
             mod.append(nn.Linear(incoming, outgoing, bias=bias))
+            
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
+        
+        # [修正 4] 最后一层也必须使用传入的 bias 参数
         mod.append(nn.Linear(incoming, out_dim, bias=bias))
+        
         if relu:
             mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
@@ -56,14 +60,19 @@ class MLP_ST(nn.Module):
                 outgoing = incoming
             else:
                 outgoing = layers[layer_ind]
+            
+            # [修正 4] Conv1d 也使用传入的 bias 参数
             mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
+            
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
+        
         mod.append(nn.Conv1d(incoming, out_dim, kernel_size=3, bias=bias, padding=1))
+        
         if relu:
             mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
@@ -125,7 +134,7 @@ class CustomCLIP(nn.Module):
 
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
-        
+
         self.c_param = nn.Parameter(torch.tensor(1.0).log())
         self._curv_minmax = {
             "max": math.log(1.0 * 10), 
@@ -133,18 +142,22 @@ class CustomCLIP(nn.Module):
         }
 
         # ---------------------------------------------------------------------
-        # [Logit Scale] Respect Config Settings
+        # [修正 2] Logit Scale Initialization (HyCoCLIP 默认值)
         # ---------------------------------------------------------------------
-        # Read cosine_scale from config (e.g., 5.0 or 100.0)
-        # CLIP's logit_scale is stored in log space, exp() is used during calculation
-        # So take math.log(cosine_scale) here
-        scale_val = cfg.visual.cosine_scale if hasattr(cfg.visual, 'cosine_scale') else 100.0
-        print(f"[CustomCLIP] Initializing Logit Scale from Config: {scale_val} (Log space: {math.log(scale_val):.4f})")
-        
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(scale_val)))
+        # 不再读取 Config，强制使用 HyCoCLIP 的默认值 1/0.07 (约 14.3)
+        # 配合极小的 Alpha 初始化，这能提供足够的初始梯度
+        init_logit_scale = 1.0 / 0.07
+        print(f"[CustomCLIP] Initializing Logit Scale to HyCoCLIP default: {init_logit_scale:.4f} (log space)")
+        self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale).log())
 
-        init_scale = 0.5 
-        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_scale} (Log space)")
+        # ---------------------------------------------------------------------
+        # [修正 2] Alpha Initialization (HyCoCLIP 默认值)
+        # ---------------------------------------------------------------------
+        # 不再使用 0.5，而是使用 embed_dim ** -0.5
+        # 对于 512 维，这个值约为 0.044
+        # 这种极小的初始化值确保特征开始时聚集在双曲原点附近（类欧氏区）
+        init_scale = float(cfg.emb_dim) ** -0.5
+        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_scale:.6f} (Log space)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_scale).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_scale).log())
 
@@ -153,20 +166,24 @@ class CustomCLIP(nn.Module):
         except:
             fc_emb = [cfg.fc_emb]
         
-        # Handle empty string case
         layers = []
         if isinstance(fc_emb, list) and len(fc_emb) == 1 and fc_emb[0] == '':
              layers = []
         else:
              layers = [int(a) for a in fc_emb if a != '']
 
+        # ---------------------------------------------------------------------
+        # [修正 3 & 4] Bias = False
+        # ---------------------------------------------------------------------
+        # 实例化 MLP 时显式传入 bias=False
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False, norm=True, layers=layers)
+                           dropout=False, norm=True, layers=layers, bias=False)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False, norm=True, layers=layers)
+                              dropout=False, norm=True, layers=layers, bias=False)
 
-        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
+        # 实例化 Linear 时显式传入 bias=False
+        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=False)
+        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=False)
 
         self.cached_hierarchy = {} 
         self.clip_tokenize = clip.tokenize
@@ -246,11 +263,15 @@ class CustomCLIP(nn.Module):
         video_features = self.video_encoder(video)
 
         with torch.cuda.amp.autocast(enabled=False):
+            # -----------------------------------------------------------------
+            # [修正 1] 参数钳制 (无 clip_norm)
+            # -----------------------------------------------------------------
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
             current_c = self.c_param.exp() 
             
-            self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=2.0) 
-            self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=2.0)
+            # 限制 Alpha 不超过 0.0 (Scale <= 1.0)
+            self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0) 
+            self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
             
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
@@ -271,19 +292,24 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
+            # -----------------------------------------------------------------
+            # [修正 1] 软性缩放 (Soft Scaling)
+            # -----------------------------------------------------------------
+            # 完全移除 clip_norm，只使用 Alpha 的指数进行全局缩放
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
-            verb_text_features = clip_norm(verb_text_features, max_norm=5.0) * t_scale
-            obj_text_features = clip_norm(obj_text_features, max_norm=5.0) * t_scale
-            o_feat = clip_norm(o_feat, max_norm=5.0) * v_scale
-            v_feat = clip_norm(v_feat, max_norm=5.0) * v_scale
+            verb_text_features = verb_text_features * t_scale
+            obj_text_features = obj_text_features * t_scale
+            o_feat = o_feat * v_scale
+            v_feat = v_feat * v_scale
 
-            cv_euc = clip_norm(cv_euc, max_norm=5.0) * t_scale
-            co_euc = clip_norm(co_euc, max_norm=5.0) * t_scale
-            comp_v_euc = clip_norm(comp_v_euc, max_norm=5.0) * t_scale
-            comp_o_euc = clip_norm(comp_o_euc, max_norm=5.0) * t_scale
+            cv_euc = cv_euc * t_scale
+            co_euc = co_euc * t_scale
+            comp_v_euc = comp_v_euc * t_scale
+            comp_o_euc = comp_o_euc * t_scale
 
+            # Map to Hyperbolic
             verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
             obj_text_hyp = LorentzMath.exp_map_0(obj_text_features, c=current_c)
             o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
@@ -297,7 +323,7 @@ class CustomCLIP(nn.Module):
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
-            # Use the loaded logit_scale
+            # [HyCoCLIP Style] Clamp Logit Scale max to ~100 (ln 4.6)
             with torch.no_grad():
                 self.logit_scale.clamp_(max=4.6052)
             logit_scale = self.logit_scale.exp()
@@ -344,17 +370,34 @@ def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Hyperbolic Version - Fixed)")
+    print("Building custom CLIP (Hyperbolic Version - HyCoCLIP Aligned)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     for name, param in model.named_parameters():
         param.requires_grad_(False)
-        if "prompt_learner" in name and cfg.learn_input_method != 'zero':
-            param.requires_grad_(True)
+        if "prompt_learner" in name:
+            if cfg.learn_input_method != 'zero':
+                if cfg.learn_input_method == 'coop':
+                    if 'prompt_vectors' in name:
+                        param.requires_grad_(True)
+                        print(f'{name}: {param.requires_grad}')
+                elif cfg.learn_input_method == 'csp':
+                    if 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
+                        param.requires_grad_(True)
+                        print(f'{name}: {param.requires_grad}')
+                elif cfg.learn_input_method == 'spm':
+                    if 'prompt_vectors' in name or 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
+                        param.requires_grad_(True)
+                        print(f'{name}: {param.requires_grad}')
+                else:
+                    raise NotImplementedError
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
+                print(f'{name}: {param.requires_grad}')
         elif 'c2c' in name:
             param.requires_grad = True
+            print(f'{name}: {param.requires_grad}')
+        # [补充] 确保双曲参数可学习
         elif 'c_param' in name:
             param.requires_grad = True
         elif 'visual_alpha' in name or 'textual_alpha' in name:
