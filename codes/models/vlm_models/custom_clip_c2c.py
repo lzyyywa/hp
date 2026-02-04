@@ -16,12 +16,11 @@ except ImportError:
 
 _tokenizer = _Tokenizer()
 
-# [修正 1] 改进的模长截断函数
-# 允许模长在 [0, max_norm] 之间变化，保留层级信息（模长代表离根节点的距离）
-# 只有当模长超过 max_norm 时才进行缩放，而不是强制归一化
+# =========================================================================
+# [核心修复 1] 模长软截断函数
+# =========================================================================
 def clip_norm(x, max_norm=5.0):
     norm = x.norm(p=2, dim=-1, keepdim=True)
-    # 仅在 norm > max_norm 时生效，否则保持原样
     target_norm = torch.clamp(norm, max=max_norm)
     return x * (target_norm / (norm + 1e-6))
 
@@ -135,33 +134,42 @@ class CustomCLIP(nn.Module):
         # ---------------------------------------------------------------------
         self.c_param = nn.Parameter(torch.tensor(1.0).log())
         
-        # Constraints for curvature learning
         self._curv_minmax = {
             "max": math.log(1.0 * 10), 
             "min": math.log(1.0 / 10), 
         }
 
-        # CLIP Logit Scale (learnable)
-        self.logit_scale = clip_model.logit_scale
+        # ---------------------------------------------------------------------
+        # [HyCoCLIP Critical Fix] Logit Scale Initialization
+        # ---------------------------------------------------------------------
+        # 初始化为 log(5) ≈ 1.6，配合距离，使初始 Logits 落在 -5 ~ -10 的敏感区间。
+        self.logit_scale = nn.Parameter(torch.tensor(1.6)) 
 
         # ---------------------------------------------------------------------
-        # [修正 2] Alpha (Scale) Initialization
-        # 之前的值 (dim**-0.5 ≈ 0.044) 太小，导致所有点塌缩在原点，梯度消失/不稳定。
-        # 修正为 0.5，确保初始状态下点在双曲空间有一定分布。
+        # [核心修复 2] Scale (Alpha) Initialization
         # ---------------------------------------------------------------------
-        # init_scale = float(cfg.emb_dim) ** -0.5  <-- 导致问题的旧代码
         init_scale = 0.5 
         print(f"[CustomCLIP] Initializing visual/textual alpha to {init_scale} (Log space)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_scale).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_scale).log())
 
-        try:
-            fc_emb = cfg.fc_emb.split(',')
-        except:
-            fc_emb = [cfg.fc_emb]
-        layers = [int(a) for a in fc_emb]
-
-        # Projection layers (Your specific C2C architecture)
+        # ---------------------------------------------------------------------
+        # [修复] 健壮的 fc_emb 解析逻辑
+        # ---------------------------------------------------------------------
+        layers = []
+        if hasattr(cfg, 'fc_emb') and cfg.fc_emb:
+            if isinstance(cfg.fc_emb, str):
+                # 过滤掉空字符串，防止 invalid literal for int()
+                cleaned = cfg.fc_emb.strip()
+                if cleaned:
+                    layers = [int(a) for a in cleaned.split(',') if a.strip()]
+            elif isinstance(cfg.fc_emb, int):
+                layers = [cfg.fc_emb]
+            elif isinstance(cfg.fc_emb, list):
+                layers = [int(a) for a in cfg.fc_emb]
+        
+        # 如果是单层结构，layers 应为空列表，这是符合预期的
+        # Projection layers
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                            dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
@@ -185,8 +193,11 @@ class CustomCLIP(nn.Module):
             if isinstance(m, nn.Module):
                 for sub_m in m.modules():
                     if isinstance(sub_m, nn.Linear):
+                        # [Identity Init Check]
+                        # 只有当 feat_dim == emb_dim (512==512) 时，这里才会触发 Identity
                         if sub_m.in_features == sub_m.out_features:
                             nn.init.eye_(sub_m.weight)
+                            # 给一个极小的扰动，打破完美对称但保留对角主导
                             sub_m.weight.data.add_(torch.randn_like(sub_m.weight) * 0.001)
                         else:
                             nn.init.orthogonal_(sub_m.weight, gain=1.0)
@@ -215,20 +226,15 @@ class CustomCLIP(nn.Module):
         print(f"[CustomCLIP] Ready to cache.")
 
     def _ensure_hierarchy_cached(self, device):
-        # Only cache BACKBONE features (Frozen)
         if "coarse_verb_backbone" in self.cached_hierarchy:
             return 
-
         print(f"[CustomCLIP] Caching BACKBONE outputs (Frozen) on {device}...")
         self.model_device = device
-        
         with torch.no_grad():
             cv_backbone = self._encode_plain_text(self.coarse_verb_tokens)
             self.cached_hierarchy["coarse_verb_backbone"] = cv_backbone.float()
-
             co_backbone = self._encode_plain_text(self.coarse_obj_tokens)
             self.cached_hierarchy["coarse_obj_backbone"] = co_backbone.float()
-
             batch_size = 500
             comp_embs = []
             total = self.comp_tokens.shape[0]
@@ -236,10 +242,8 @@ class CustomCLIP(nn.Module):
                 batch_tokens = self.comp_tokens[i : i + batch_size]
                 emb = self._encode_plain_text(batch_tokens)
                 comp_embs.append(emb.cpu())
-            
             comp_emb_all = torch.cat(comp_embs, dim=0).to(device)
             self.cached_hierarchy["comp_backbone"] = comp_emb_all.float()
-            
         print(f"[CustomCLIP] Backbone Cache finished.")
 
     def forward(self, video, pairs=None):
@@ -250,7 +254,6 @@ class CustomCLIP(nn.Module):
 
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
-        
         obj_prompts = self.obj_prompt_learner()
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
 
@@ -263,7 +266,7 @@ class CustomCLIP(nn.Module):
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
             current_c = self.c_param.exp() 
             
-            # Alpha 必须是正数，这里通常不做 max 限制，或者 max=0.0 (Scale=1.0)
+            # 限制 Alpha 上限
             self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=2.0) 
             self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=2.0)
             
@@ -278,7 +281,7 @@ class CustomCLIP(nn.Module):
             v_feat_t = self.c2c_VE1(video_features)
             v_feat = v_feat_t.mean(dim=-1)
 
-            # [B] Hierarchy Projection (Uses cached backbone)
+            # [B] Hierarchy Projection
             cv_backbone = self.cached_hierarchy["coarse_verb_backbone"]
             co_backbone = self.cached_hierarchy["coarse_obj_backbone"]
             comp_backbone = self.cached_hierarchy["comp_backbone"]
@@ -288,14 +291,10 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
-            # [修正 3] 模长处理 (Geometry Preservation)
-            # 原错误: F.normalize(...) 导致层级丢失。
-            # 修正: 使用 clip_norm 允许模长变化，并乘以前端的 scale 参数。
-            
+            # [核心修复 3] 模长处理 (Geometry Preservation)
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
-            # 使用 clip_norm 代替 F.normalize，max_norm 设为 5.0 以容纳层级结构
             verb_text_features = clip_norm(verb_text_features, max_norm=5.0) * t_scale
             obj_text_features = clip_norm(obj_text_features, max_norm=5.0) * t_scale
             o_feat = clip_norm(o_feat, max_norm=5.0) * v_scale
@@ -318,7 +317,6 @@ class CustomCLIP(nn.Module):
             comp_hyp_o = LorentzMath.exp_map_0(comp_o_euc, c=current_c)
 
             # [E] Distances
-            # 注意: hyp_distance 内部已经有 clamp，这里直接调用即可
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
@@ -349,8 +347,6 @@ class CustomCLIP(nn.Module):
             else:
                 if pairs is not None:
                     verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                    # CRITICAL: Hyperbolic fusion MUST be ADDITIVE in logit space (negative distance).
-                    # DO NOT CHANGE TO MULTIPLICATION.
                     combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
                     return combined_logits 
                 else:
@@ -372,7 +368,7 @@ def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Hyperbolic Version - Fixed)")
+    print("Building custom CLIP (Hyperbolic Version - Ready for Training)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
     for name, param in model.named_parameters():
         param.requires_grad_(False)
