@@ -7,8 +7,7 @@ import torch
 from torch.utils.data.dataloader import DataLoader
 import torch.nn.functional as F
 
-import test  # [Fix] Clean import
-# [IMPORT] Import the upgraded Loss and Helper
+import test
 from loss import H2EMTotalLoss
 from utils.hierarchy_helper import HierarchyHelper
 
@@ -88,7 +87,20 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # =========================================================================
     # [STEP 2] Instantiate the Encapsulated Loss
     # =========================================================================
-    criterion = H2EMTotalLoss(beta1=1.0, beta2=0.1, beta3=0.5).cuda()
+    # 1. 动态读取 Config
+    main_beta = getattr(config, 'beta', 1.0)
+    beta_da   = getattr(config, 'beta_da', main_beta) # Default to main beta
+    beta_te   = getattr(config, 'beta_te', 0.1)
+    beta_prim = getattr(config, 'beta_prim', 0.5)
+    
+    print(f"[Loss Init] Temp: 1.0 (Model Handles Scale) | Beta_DA: {beta_da} | Beta_TE: {beta_te} | Beta_Prim: {beta_prim}")
+
+    # 2. Temperature 设为 1.0，避免与 CustomCLIP 内部的 Logit Scale 叠加导致爆炸
+    criterion = H2EMTotalLoss(
+        beta1=beta_da, 
+        beta2=beta_te, 
+        beta3=beta_prim
+    ).cuda()
     
     train_dataloader = DataLoader(
         train_dataset,
@@ -118,31 +130,19 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
 
-            # ==================================================================================
-            # [HyCoCLIP Strategy Implementation] 
-            # 1. Use AMP for Backbone logic
-            # 2. Force Loss Calculation in Float32 to avoid NaN in Hyperbolic Ops
-            # ==================================================================================
-
             # [A] Forward Pass (Auto-Mixed Precision)
             with torch.cuda.amp.autocast(enabled=True): 
-                # custom_clip_c2c.py handles switching to float32 internally for hyperbolic parts
-                # but we keep this context for the visual encoder backbone.
                 out = model(batch_img)
             
             # [B] Loss Calculation (Strictly Float32)
-            # We move this OUTSIDE autocast to prevent any accidental downcasting 
-            # of the hyperbolic distances before loss computation.
             loss, loss_dict = criterion(out, batch_verb, batch_obj, batch_target, 
                                         p2v, p2o, v2cv, o2co)
                 
             loss = loss / config.gradient_accumulation_steps
 
             # [Safety Check] NaN Loss Skip (CRITICAL for Hyperbolic Training)
-            # If loss is NaN, we must SKIP this step to avoid poisoning the model weights.
             if torch.isnan(loss):
                 print(f"[Warning] NaN loss detected at epoch {i+1}, batch {bid}. Skipping step.")
-                optimizer.zero_grad()
                 continue
 
             # [C] Backward Pass
@@ -153,20 +153,23 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 scaler.unscale_(optimizer)
                 
                 # [Critical] Gradient Clipping for Hyperbolic stability
-                # Ensures gradients don't explode near the boundary of the Poincare ball
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
-            # Record loss values
+            # Record loss values (FIXED: Compatible with both Tensor and Float)
             for k, v in loss_dict.items():
                 if k not in loss_meters:
                     loss_meters[k] = []
-                # Only record valid losses
-                if not torch.isnan(v) and not torch.isinf(v):
-                    loss_meters[k].append(v.item() if isinstance(v, torch.Tensor) else v)
+                
+                # 1. 统一转为 float 数值 (如果是 Tensor 则取 .item())
+                val = v.item() if isinstance(v, torch.Tensor) else v
+                
+                # 2. 使用 numpy 检查数值有效性 (numpy 可以处理 float)
+                if not np.isnan(val) and not np.isinf(val):
+                    loss_meters[k].append(val)
 
             progress_bar.set_postfix({
                 "Total": f"{np.mean(loss_meters['Total'][-50:]) if loss_meters['Total'] else 0:.3f}",
