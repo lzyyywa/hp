@@ -49,7 +49,7 @@ class LorentzMath:
         return torch.cat([x_time, x_space], dim=-1)
         
     @staticmethod
-    def hyp_distance(x, y, c=1.0, keepdim=False, eps=1e-5):
+    def hyp_distance(x, y, c=1.0, keepdim=False, eps=1e-8):
         """
         HyCoCLIP's pairwise_dist logic.
         Input x, y: [..., D+1] (Time, Space)
