@@ -30,10 +30,10 @@ data:
 
 #======compositional module setting======
 c2c:
-  nlayers: 2
-  fc_emb: 768,1024,1200
+  nlayers: 1
+  fc_emb: ""
   feat_dim: 512
-  emb_dim: 300
+  emb_dim: 512
   relu: False
 
 #======visual encoder setting======
