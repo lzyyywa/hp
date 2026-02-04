@@ -100,14 +100,14 @@ class H2EMTotalLoss(nn.Module):
     H2EM Paper Eq. (16) Wrapper.
     Orchestrates the total loss calculation for the Hyperbolic framework.
     """
-    def __init__(self, temperature=None, beta1=1.0, beta2=0.1, beta3=0.5):
+    def __init__(self, beta1=1.0, beta2=0.1, beta3=0.5):
         super(H2EMTotalLoss, self).__init__()
         self.beta1 = beta1  # Weight for DA (Discriminative Alignment)
         self.beta2 = beta2  # Weight for TE (Taxonomic Entailment)
         self.beta3 = beta3  # Weight for Prim (Primitive Auxiliary)
         
         self.loss_cls = HyperbolicPrototypicalLoss()
-        self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.5)
+        self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.2)
 
     def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
         # [Safety Check] Ensure input is a dictionary
