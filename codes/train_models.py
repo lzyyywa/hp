@@ -88,7 +88,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # =========================================================================
     # [STEP 2] Instantiate the Encapsulated Loss
     # =========================================================================
-    criterion = H2EMTotalLoss(temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5).cuda()
+    criterion = H2EMTotalLoss(temperature=1, beta1=1.0, beta2=0.1, beta3=0.5).cuda()
     
     train_dataloader = DataLoader(
         train_dataset,
