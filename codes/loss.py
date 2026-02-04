@@ -68,7 +68,7 @@ class EntailmentConeLoss(nn.Module):
     Hierarchical Entailment Cone Loss (HyCoCLIP Style).
     Enforces that 'child' is within the cone of 'parent'.
     """
-    def __init__(self, min_radius=0.1, margin=0.01, aperture_scale=1.5):
+    def __init__(self, min_radius=0.1, margin=0.01, aperture_scale=1.2):
         super(EntailmentConeLoss, self).__init__()
         self.min_radius = min_radius
         self.margin = margin
