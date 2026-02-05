@@ -130,7 +130,7 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
 
         # [HyCoCLIP] Curvature initialization (1.0 as per paper)
-        self.c_param = nn.Parameter(torch.tensor(1.0).log())
+        self.c_param = nn.Parameter(torch.tensor(1e-7).log())
         self._curv_minmax = {
             "max": math.log(1.0 * 10), 
             "min": math.log(1e-7), 
