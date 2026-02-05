@@ -8,23 +8,23 @@ model:
 text:
   text_input_type: template #vanilla:v+o,template:fix template+v+o, :[P1,P2,P3], VERB, [P4,P5,P6,P7],OBJECT, [P8,P9,P10,P11],
 #  input_template: "An action of which the dominating object is x and the verb is x" #valid if text_input_type is template
-  input_template_verb: "A verb of  x" #valid
-  input_template_obj: "An object of  x" #valid
+  input_template_verb: "a photo of a person {}" #valid
+  input_template_obj: "a photo of a {}" #valid
 #  input_template: "The x is subjected to the x"
   learn_input: true # if false, no prompt learning
   learn_input_method: coop #coop,csp or dfsp #valid if learn_input is true
   verb_length_type: natural # one or natural ##### maybe useless!
   ctx_init: true #initialization for ctx. valid if learn_input is true
   #===train===
-  text_lr: 0.0001
-  text_wd: 0.00001
+  text_lr: 0.00003
+  text_wd: 0.000001
   ctx_length: 10
 
 
 data:
   dataset: sth-com
   #set as your own path
-  dataset_path: "/data/Disk_B/action_data/SS_data/somethingv2/20bn-something-something-v2-frames/"
+  dataset_path: "/opt/data/share/101012/data/sth-else/frames/"
   num_frames: 8
   num_workers: 4
 
@@ -43,9 +43,9 @@ visual:
   adapt_star_layer: 6
   num_tadapter: 2
   num_workers: 4
-  cosine_scale: 100
-  visual_lr: 0.0005
-  visual_wd: 0.0001
+  cosine_scale: 50
+  visual_lr: 0.0001
+  visual_wd: 0.00001
 
 code_adapt:
   arch: vit
@@ -62,7 +62,9 @@ train:
   val_epochs_ts: 45
   warmup: 3
   epoch_start: 0
-  save_path: './log/c2c_enhance_tsm/'
+  save_model: True
+  save_path: '/root/c2c_log/hp'
+
   load_model: False
   best_model_metric: AUC     #best_unseen  best_seen AUC best_loss best_hm
   eval_every_n: 5
