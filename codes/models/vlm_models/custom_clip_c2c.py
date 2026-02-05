@@ -16,8 +16,6 @@ except ImportError:
 
 _tokenizer = _Tokenizer()
 
-
-
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP, self).__init__()
@@ -131,18 +129,29 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
 
+        # [HyCoCLIP] Curvature initialization (1.0 as per paper)
         self.c_param = nn.Parameter(torch.tensor(1.0).log())
         self._curv_minmax = {
             "max": math.log(1.0 * 10), 
             "min": math.log(1.0 / 10), 
         }
 
-        init_logit_scale = 1.0 / 0.07
-        print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (HyCo Default)")
+        # ---------------------------------------------------------------------
+        # [FINAL CONFIG] Logit Scale Initialization
+        # ---------------------------------------------------------------------
+        # 论文 Appendix A.2: "temperature was set to the same value as pretrained CLIP"
+        # CLIP default max scale is 100. We set it high to drive gradients.
+        init_logit_scale = 100.0
+        print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (PAPER CONFIG: CLIP Default)")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
 
-        init_alpha = float(cfg.emb_dim) ** -0.5
-        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_alpha:.6f} (Back to Origin)")
+        # ---------------------------------------------------------------------
+        # [FINAL CONFIG] Alpha Initialization
+        # ---------------------------------------------------------------------
+        # 恢复为 1.0。这意味着不缩放特征，保留 CLIP 原始分布 (Scale=1.0)。
+        # 这对于微调（Fine-tuning）至关重要，避免破坏预训练知识。
+        init_alpha = 1.0
+        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_alpha:.6f} (PAPER CONFIG: No Scaling)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
 
@@ -158,17 +167,18 @@ class CustomCLIP(nn.Module):
              layers = [int(a) for a in fc_emb if a != '']
 
         # ---------------------------------------------------------------------
-        # [修正 3 & 4] Bias = False
+        # [FINAL CONFIG] Bias = True
         # ---------------------------------------------------------------------
-        # 实例化 MLP 时显式传入 bias=False
+        # 重新启用 Bias。让 Adapter 拥有完整的拟合能力。
+        # 论文没有说必须禁用 Bias，微调任务通常需要它。
+        print("[CustomCLIP] Enabling Bias for Projection Layers (Restoring Capacity)")
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False, norm=True, layers=layers, bias=False)
+                           dropout=False, norm=True, layers=layers, bias=True)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False, norm=True, layers=layers, bias=False)
+                              dropout=False, norm=True, layers=layers, bias=True)
 
-        # 实例化 Linear 时显式传入 bias=False
-        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=False)
-        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=False)
+        self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
+        self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         self.cached_hierarchy = {} 
         self.clip_tokenize = clip.tokenize
@@ -248,15 +258,11 @@ class CustomCLIP(nn.Module):
         video_features = self.video_encoder(video)
 
         with torch.cuda.amp.autocast(enabled=False):
-            # -----------------------------------------------------------------
-            # [修正 1] 参数钳制 (无 clip_norm)
-            # -----------------------------------------------------------------
+            # 钳制曲率，但不钳制 Alpha (Scale)
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
             current_c = self.c_param.exp() 
             
-            # 限制 Alpha 不超过 0.0 (Scale <= 1.0)
-            self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0) 
-            self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+            # [REMOVED] Alpha clamp (max=0.0) removed to allow learning
             
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
@@ -277,10 +283,7 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
-            # -----------------------------------------------------------------
-            # [修正 1] 软性缩放 (Soft Scaling)
-            # -----------------------------------------------------------------
-            # 完全移除 clip_norm，只使用 Alpha 的指数进行全局缩放
+            # Soft Scaling
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
