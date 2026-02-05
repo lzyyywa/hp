@@ -16,8 +16,7 @@ except ImportError:
 
 _tokenizer = _Tokenizer()
 
-# [修正 1] 删除手动 clip_norm 函数
-# 我们将完全依赖 Alpha Scaling (软缩放) 来控制模长
+
 
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -30,7 +29,6 @@ class MLP(nn.Module):
             else:
                 outgoing = layers[layer_ind]
             
-            # [修正 4] 确保所有层都使用传入的 bias 参数
             mod.append(nn.Linear(incoming, outgoing, bias=bias))
             
             incoming = outgoing
@@ -39,8 +37,7 @@ class MLP(nn.Module):
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
-        
-        # [修正 4] 最后一层也必须使用传入的 bias 参数
+    
         mod.append(nn.Linear(incoming, out_dim, bias=bias))
         
         if relu:
@@ -61,7 +58,6 @@ class MLP_ST(nn.Module):
             else:
                 outgoing = layers[layer_ind]
             
-            # [修正 4] Conv1d 也使用传入的 bias 参数
             mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
             
             incoming = outgoing
@@ -141,25 +137,14 @@ class CustomCLIP(nn.Module):
             "min": math.log(1.0 / 10), 
         }
 
-        # ---------------------------------------------------------------------
-        # [修正 2] Logit Scale Initialization (HyCoCLIP 默认值)
-        # ---------------------------------------------------------------------
-        # 不再读取 Config，强制使用 HyCoCLIP 的默认值 1/0.07 (约 14.3)
-        # 配合极小的 Alpha 初始化，这能提供足够的初始梯度
-        init_logit_scale = 1.0 / 0.07
-        print(f"[CustomCLIP] Initializing Logit Scale to HyCoCLIP default: {init_logit_scale:.4f} (log space)")
-        self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale).log())
+        init_scale_val = 100.0
+        print(f"[CustomCLIP] Initializing Logit Scale to: {init_scale_val} (log space)")
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(init_scale_val)))
 
-        # ---------------------------------------------------------------------
-        # [修正 2] Alpha Initialization (HyCoCLIP 默认值)
-        # ---------------------------------------------------------------------
-        # 不再使用 0.5，而是使用 embed_dim ** -0.5
-        # 对于 512 维，这个值约为 0.044
-        # 这种极小的初始化值确保特征开始时聚集在双曲原点附近（类欧氏区）
-        init_scale = float(cfg.emb_dim) ** -0.5
-        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_scale:.6f} (Log space)")
-        self.visual_alpha = nn.Parameter(torch.tensor(init_scale).log())
-        self.textual_alpha = nn.Parameter(torch.tensor(init_scale).log())
+        init_alpha = 0.5
+        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_alpha} (Log space)")
+        self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
+        self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
 
         try:
             fc_emb = cfg.fc_emb.split(',')
