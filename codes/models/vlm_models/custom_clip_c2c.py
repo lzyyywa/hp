@@ -130,7 +130,7 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
 
         # [HyCoCLIP] Curvature initialization (1.0 as per paper)
-        self.c_param = nn.Parameter(torch.tensor(1e-7).log())
+        self.c_param = nn.Parameter(torch.tensor(1e-5).log())
         self._curv_minmax = {
             "max": math.log(1.0 * 10), 
             "min": math.log(1e-7), 
@@ -157,11 +157,6 @@ class CustomCLIP(nn.Module):
         else:
              layers = [int(a) for a in fc_emb if a != '']
 
-        # ---------------------------------------------------------------------
-        # [FINAL CONFIG] Bias = True
-        # ---------------------------------------------------------------------
-        # 重新启用 Bias。让 Adapter 拥有完整的拟合能力。
-        # 论文没有说必须禁用 Bias，微调任务通常需要它。
         print("[CustomCLIP] Enabling Bias for Projection Layers (Restoring Capacity)")
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                            dropout=False, norm=True, layers=layers, bias=True)
