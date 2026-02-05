@@ -91,7 +91,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # [FINAL FIX] Hardcode "full-power parameters" - no longer dependent on Config reading
     # Scale=100 (in Model), TE=1.0 (here), LR=2e-4 (in Config)
     # The combination of these three forms the complete "aggressive fine-tuning strategy"
-    print(f"[Loss Init] FORCING HIGH POWER PARAMS: Beta_DA=1.0 | Beta_TE=1.0 (Critical) | Beta_Prim=0.5")
     
     criterion = H2EMTotalLoss(
         beta1=1.0,  # DA (Classification)
