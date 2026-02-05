@@ -136,21 +136,11 @@ class CustomCLIP(nn.Module):
             "min": math.log(1.0 / 10), 
         }
 
-        # ---------------------------------------------------------------------
-        # [FINAL CONFIG] Logit Scale Initialization
-        # ---------------------------------------------------------------------
-        # 论文 Appendix A.2: "temperature was set to the same value as pretrained CLIP"
-        # CLIP default max scale is 100. We set it high to drive gradients.
-        init_logit_scale = 100.0
+        
+        init_logit_scale = 14.3
         print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (PAPER CONFIG: CLIP Default)")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
 
-        # ---------------------------------------------------------------------
-        # [FINAL CONFIG] Alpha Initialization
-        # ---------------------------------------------------------------------
-        # 恢复为 1.0。这意味着不缩放特征，保留 CLIP 原始分布 (Scale=1.0)。
-        # 这对于微调（Fine-tuning）至关重要，避免破坏预训练知识。
-        init_alpha = 1.0
         print(f"[CustomCLIP] Initializing visual/textual alpha to {init_alpha:.6f} (PAPER CONFIG: No Scaling)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
