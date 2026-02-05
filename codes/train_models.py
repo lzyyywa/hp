@@ -11,16 +11,17 @@ import test
 from loss import H2EMTotalLoss
 from utils.hierarchy_helper import HierarchyHelper
 
-def cal_conditional(attr2idx, obj2idx, set_name, daset):
+def cal_conditional(attr2idx, obj2idx, set_name, dataset):
     def load_split(path):
         with open(path, 'r') as f:
             loaded_data = json.load(f)
         return loaded_data
 
-    train_data = daset.train_data
-    val_data = daset.val_data
-    test_data = daset.test_data
+    train_data = dataset.train_data
+    val_data = dataset.val_data
+    test_data = dataset.test_data
     all_data = train_data + val_data + test_data
+    
     if set_name == 'test':
         used_data = test_data
     elif set_name == 'all':
@@ -87,19 +88,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     # =========================================================================
     # [STEP 2] Instantiate the Encapsulated Loss
     # =========================================================================
-    # 1. 动态读取 Config
-    main_beta = getattr(config, 'beta', 1.0)
-    beta_da   = getattr(config, 'beta_da', main_beta) # Default to main beta
-    beta_te   = getattr(config, 'beta_te', 0.1)
-    beta_prim = getattr(config, 'beta_prim', 0.5)
+    # [FINAL FIX] Hardcode "full-power parameters" - no longer dependent on Config reading
+    # Scale=100 (in Model), TE=1.0 (here), LR=2e-4 (in Config)
+    # The combination of these three forms the complete "aggressive fine-tuning strategy"
+    print(f"[Loss Init] FORCING HIGH POWER PARAMS: Beta_DA=1.0 | Beta_TE=1.0 (Critical) | Beta_Prim=0.5")
     
-    print(f"[Loss Init] Temp: 1.0 (Model Handles Scale) | Beta_DA: {beta_da} | Beta_TE: {beta_te} | Beta_Prim: {beta_prim}")
-
-    # 2. Temperature 设为 1.0，避免与 CustomCLIP 内部的 Logit Scale 叠加导致爆炸
     criterion = H2EMTotalLoss(
-        beta1=beta_da, 
-        beta2=beta_te, 
-        beta3=beta_prim
+        beta1=1.0,  # DA (Classification)
+        beta2=1.0,  # TE (Hierarchy Constraint) - previously defaulted to 0.1 due to config read failure, now forced to 1.0
+        beta3=0.5   # Prim (Auxiliary)
     ).cuda()
     
     train_dataloader = DataLoader(
@@ -140,9 +137,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
             loss = loss / config.gradient_accumulation_steps
 
-            # [Safety Check] NaN Loss Skip (CRITICAL for Hyperbolic Training)
+            # [Safety Check] NaN Loss Skip
             if torch.isnan(loss):
                 print(f"[Warning] NaN loss detected at epoch {i+1}, batch {bid}. Skipping step.")
+                optimizer.zero_grad()
                 continue
 
             # [C] Backward Pass
@@ -159,15 +157,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 scaler.update()
                 optimizer.zero_grad()
 
-            # Record loss values (FIXED: Compatible with both Tensor and Float)
+            # Record loss values
             for k, v in loss_dict.items():
                 if k not in loss_meters:
                     loss_meters[k] = []
                 
-                # 1. 统一转为 float 数值 (如果是 Tensor 则取 .item())
+                # 1. Convert to float uniformly
                 val = v.item() if isinstance(v, torch.Tensor) else v
                 
-                # 2. 使用 numpy 检查数值有效性 (numpy 可以处理 float)
+                # 2. Check numerical validity with numpy
                 if not np.isnan(val) and not np.isinf(val):
                     loss_meters[k].append(val)
 
