@@ -95,7 +95,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     
     criterion = H2EMTotalLoss(
         beta1=1.0,  # DA (Classification)
-        beta2=1.0,  # TE (Hierarchy Constraint) - previously defaulted to 0.1 due to config read failure, now forced to 1.0
+        beta2=0.1,  # TE (Hierarchy Constraint) - previously defaulted to 0.1 due to config read failure, now forced to 1.0
         beta3=0.5   # Prim (Auxiliary)
     ).cuda()
     
