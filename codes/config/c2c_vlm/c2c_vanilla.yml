@@ -43,7 +43,7 @@ visual:
   adapt_star_layer: 6
   num_tadapter: 2
   num_workers: 4
-  cosine_scale: 50
+  cosine_scale: 100
   visual_lr: 0.0001
   visual_wd: 0.00001
 
