@@ -137,9 +137,9 @@ class CustomCLIP(nn.Module):
             "min": math.log(1.0 / 10), 
         }
 
-        init_scale_val = 50
-        print(f"[CustomCLIP] Initializing Logit Scale to: {init_scale_val} (log space)")
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(init_scale_val)))
+        init_logit_scale = 1.0 / 0.07
+        print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (HyCo Default)")
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
 
         init_alpha = float(cfg.emb_dim) ** -0.5
         print(f"[CustomCLIP] Initializing visual/textual alpha to {init_alpha:.6f} (Back to Origin)")
