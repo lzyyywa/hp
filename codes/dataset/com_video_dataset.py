@@ -91,11 +91,15 @@ class CompositionVideoDataset(Dataset):
         self.phase = phase
         self.split = split
         self.open_world = open_world
-        split_root='./data_split/sth_com/'
-        self.splitroot =split_root
-        self.test_json=test_json
-        self.val_json='val_pairs.json'
-        self.ex_test_json=ex_test_json
+        split_root = './data_split/sth_com/'
+        self.splitroot = split_root
+        
+        # Define hierarchy root path based on split_root
+        self.hierarchy_root = './data_split/hierarchy/'
+        
+        self.test_json = test_json
+        self.val_json = 'val_pairs.json'
+        self.ex_test_json = ex_test_json
 
         # todo about video sampling #230612:seems done
         self.tdn_input = tdn_input
@@ -112,7 +116,7 @@ class CompositionVideoDataset(Dataset):
 
         self.attrs, self.objs, self.pairs, \
         self.train_pairs, self.val_pairs, \
-        self.test_pairs,self.ex_test_pairs = self.parse_split()
+        self.test_pairs, self.ex_test_pairs = self.parse_split()
 
         if self.open_world:
             self.pairs = list(product(self.attrs, self.objs))
@@ -129,6 +133,22 @@ class CompositionVideoDataset(Dataset):
         self.obj2idx = {obj: idx for idx, obj in enumerate(self.objs)}
         self.attr2idx = {attr: idx for idx, attr in enumerate(self.attrs)}
         self.pair2idx = {pair: idx for idx, pair in enumerate(self.pairs)}
+
+        # =========================================================
+        # [MODIFIED] Load Hierarchy Mappings & Build Coarse Indices
+        # =========================================================
+        self._load_hierarchy_mappings()
+        
+        # Build Lookup tables for Strings (Optional but good for debug)
+        self.coarse_attrs = sorted(list(set(self.verb_mapping.values())))
+        self.coarse_objs = sorted(list(set(self.obj_mapping.values())))
+        
+        # Build Coarse Index Maps
+        self.coarse_attr2idx = {attr: idx for idx, attr in enumerate(self.coarse_attrs)}
+        self.coarse_obj2idx = {obj: idx for idx, obj in enumerate(self.coarse_objs)}
+        
+        print(f'# coarse verbs: {len(self.coarse_attrs)} | # coarse objects: {len(self.coarse_objs)}')
+        # =========================================================
 
         print('# train pairs: %d | # val pairs: %d | # test pairs: %d' % (len(
             self.train_pairs), len(self.val_pairs), len(self.test_pairs)))
@@ -178,7 +198,7 @@ class CompositionVideoDataset(Dataset):
             self.unseen_pairs = list(unseen_pairs)
             self.unseen_pair2idx = {pair: idx for idx, pair in enumerate(self.unseen_pairs)}
 
-        self.return_n_matrix=return_n_matrix
+        self.return_n_matrix = return_n_matrix
 
         self.ade_input = ade_input
         if ade_input:
@@ -206,6 +226,21 @@ class CompositionVideoDataset(Dataset):
                 self.train_obj_set[_obj] = list(set(candidates))
                 self.train_obj_set_attr_num[_obj] = len(
                     set([self.train_data[idx][1] for idx in self.train_obj_set[_obj]]))
+
+    def _load_hierarchy_mappings(self):
+        """Helper to load coarse-grained mappings from JSON"""
+        verb_map_path = ospj(self.hierarchy_root, 'verb_coarse_mapping.json')
+        obj_map_path = ospj(self.hierarchy_root, 'obj_coarse_mapping.json')
+        
+        if not os.path.exists(verb_map_path) or not os.path.exists(obj_map_path):
+             raise FileNotFoundError(f"Hierarchy mapping files not found at {self.hierarchy_root}. "
+                                     "Please ensure 'verb_coarse_mapping.json' and 'obj_coarse_mapping.json' exist.")
+
+        with open(verb_map_path, 'r') as f:
+            self.verb_mapping = json.load(f)
+        
+        with open(obj_map_path, 'r') as f:
+            self.obj_mapping = json.load(f)
 
     def prepare_data(self):
         frame_cnts = {}
@@ -264,11 +299,11 @@ class CompositionVideoDataset(Dataset):
 
         # now we compose all objs, attrs and pairs
         all_attrs, all_objs = sorted(
-            list(set(tr_attrs + vl_attrs + ts_attrs+ex_ts_attrs))), sorted(
-            list(set(tr_objs + vl_objs + ts_objs+ex_ts_objs)))
-        all_pairs = sorted(list(set(tr_pairs + vl_pairs + ts_pairs+ex_ts_pairs)))
+            list(set(tr_attrs + vl_attrs + ts_attrs + ex_ts_attrs))), sorted(
+            list(set(tr_objs + vl_objs + ts_objs + ex_ts_objs)))
+        all_pairs = sorted(list(set(tr_pairs + vl_pairs + ts_pairs + ex_ts_pairs)))
 
-        return all_attrs, all_objs, all_pairs, tr_pairs, vl_pairs, ts_pairs,ex_ts_pairs
+        return all_attrs, all_objs, all_pairs, tr_pairs, vl_pairs, ts_pairs, ex_ts_pairs
 
     def load_frame(self, vid_name, frame_idx):
         """
@@ -365,7 +400,6 @@ class CompositionVideoDataset(Dataset):
         while new_attr == attr and new_obj == obj:
             new_attr, new_obj = self.train_pairs[np.random.choice(
                 len(self.train_pairs))]
-
 
         return [self.attr2idx[new_attr], self.obj2idx[new_obj]]
 
@@ -470,6 +504,16 @@ class CompositionVideoDataset(Dataset):
         id, attr, obj = self.data[index]
         vid = self._load_video(id)
         vid = self.transform(vid)
+
+        # [MODIFIED] Retrieve Coarse Indices
+        # Use .get(attr, attr) to fallback to the original attribute if mapping is missing
+        # This prevents crashes if the JSON is incomplete
+        coarse_attr_str = self.verb_mapping.get(attr, attr)
+        coarse_obj_str = self.obj_mapping.get(obj, obj)
+        
+        c_attr_idx = self.coarse_attr2idx[coarse_attr_str]
+        c_obj_idx = self.coarse_obj2idx[coarse_obj_str]
+
         if self.phase == 'train':
             data = [
                 vid, self.attr2idx[attr], self.obj2idx[obj], self.train_pair_to_idx[(attr, obj)]
@@ -483,6 +527,12 @@ class CompositionVideoDataset(Dataset):
 
                 data.append(n_c_v)
                 data.append(n_c_o)
+            
+            # [MODIFIED] Append coarse indices to the training data list
+            # Position: After n_c_o and before ade_input/aux_input
+            # NOTE: You must update loss.py to unpack these correctly!
+            data.append(c_attr_idx)
+            data.append(c_obj_idx)
 
             if self.ade_input:
                 img_diff_obj_path, img_diff_attr_path = self.sample_neg_images(attr, obj)
@@ -532,6 +582,9 @@ class CompositionVideoDataset(Dataset):
             data = [
                 vid, self.attr2idx[attr], self.obj2idx[obj], self.pair2idx[(attr, obj)]
             ]
+            # [MODIFIED] Also return coarse indices during validation/test if needed for evaluation
+            data.append(c_attr_idx)
+            data.append(c_obj_idx)
 
         return data
 
