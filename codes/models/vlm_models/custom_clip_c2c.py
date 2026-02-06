@@ -16,6 +16,7 @@ except ImportError:
 
 _tokenizer = _Tokenizer()
 
+
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP, self).__init__()
@@ -44,6 +45,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.mod(x)
+
 
 class MLP_ST(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -81,27 +83,31 @@ class MLP_ST(nn.Module):
                 x = o(x)
         return x
 
+
 class TextEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
         self.transformer = clip_model.transformer
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
-        full_mask = self.transformer.resblocks[0].attn_mask.clone()
-        self.register_buffer('causal_mask', full_mask)
+        
+        # [REVERTED TO BASELINE]
+        # 使用静态切片，不再使用 register_buffer 和动态 mask
+        for block in self.transformer.resblocks:
+            block.attn_mask = block.attn_mask[:cfg.ctx_length, :cfg.ctx_length]
+            
         self.dtype = clip_model.dtype
 
     def forward(self, x, tokenized_prompts):
+        # [REVERTED TO BASELINE]
+        # 恢复原始的 forward 逻辑，不涉及 mask 的动态调整
         x = x.permute(1, 0, 2)
-        L = x.shape[0] 
-        current_mask = self.causal_mask[:L, :L]
-        for block in self.transformer.resblocks:
-            block.attn_mask = current_mask
         x = self.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.ln_final(x)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
+
 
 class VideoEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
@@ -118,19 +124,29 @@ class VideoEncoder(nn.Module):
         out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
         return out
 
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
+        # Text Prompt Learners
         self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
         self.verb_tokenized_prompts = self.verb_prompt_learner.token_ids
         self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
         self.obj_tokenized_prompts = self.obj_prompt_learner.token_ids
 
+        # Encoders
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
 
         # ---------------------------------------------------------------------
-        # [FIX 1] Curvature = 1.0 (Align with H2EM Loss)
+        # [REVERTED TO BASELINE]
+        # 直接使用预训练的 logit_scale，不重新初始化
+        # ---------------------------------------------------------------------
+        self.logit_scale = clip_model.logit_scale
+
+        # ---------------------------------------------------------------------
+        # [NEW ADDITION] Hyperbolic Parameters (Curvature & Alphas)
+        # 这些是双曲空间必需的新参数，保留
         # ---------------------------------------------------------------------
         self.c_param = nn.Parameter(torch.tensor(1.0).log())
         self._curv_minmax = {
@@ -138,18 +154,7 @@ class CustomCLIP(nn.Module):
             "min": math.log(1e-7),
         }
 
-        # ---------------------------------------------------------------------
-        # [FIX 2] Scale = 14.3 (Prevent Gradient Lock)
-        # ---------------------------------------------------------------------
-        init_logit_scale = 14.3
-        print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (Safe Start)")
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
-        
-        # ---------------------------------------------------------------------
-        # [FIX 3] Alpha = 0.044 (Prevent Explosion at c=1.0)
-        # ---------------------------------------------------------------------
         init_alpha = 1.0 / (float(cfg.emb_dim) ** 0.5)
-        print(f"[CustomCLIP] Initializing Alpha to {init_alpha:.6f} (Origin Constraint)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
 
@@ -164,45 +169,25 @@ class CustomCLIP(nn.Module):
         else:
              layers = [int(a) for a in fc_emb if a != '']
 
-        print("[CustomCLIP] Enabling Bias for Projection Layers (Restoring Capacity)")
+        # Independent Learning Modules (Projectors)
+        # [REVERTED TO BASELINE] 移除了 bias=True 的显式强调（虽然基线默认可能是True，但保持调用一致）
+        # 最重要的是：这里将使用 PyTorch 默认初始化，不再调用自定义的 _init_hyperbolic_modules
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False, norm=True, layers=layers, bias=True)
+                           dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False, norm=True, layers=layers, bias=True)
+                              dropout=False, norm=True, layers=layers)
 
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
+        # Hierarchy caching (New addition, keep)
         self.cached_hierarchy = {} 
         self.clip_tokenize = clip.tokenize
         self.token_embedding = clip_model.token_embedding
         self.positional_embedding = clip_model.positional_embedding
         self.model_device = next(self.parameters()).device
         
-        self._init_hyperbolic_modules()
-
-    def _init_hyperbolic_modules(self):
-        print("[CustomCLIP] Applying Random Initialization (NO IDENTITY)...")
-        # ---------------------------------------------------------------------
-        # [FIX 4] REMOVE IDENTITY/DIRAC! USE KAIMING/ORTHOGONAL!
-        # This is CRITICAL for learning temporal features in Conv1d.
-        # ---------------------------------------------------------------------
-        for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
-            if isinstance(m, nn.Module):
-                for sub_m in m.modules():
-                    if isinstance(sub_m, nn.Linear):
-                        # Orthogonal for Linear
-                        nn.init.orthogonal_(sub_m.weight, gain=1.0)
-                        if sub_m.bias is not None:
-                            nn.init.constant_(sub_m.bias, 0.0)
-                    elif isinstance(sub_m, nn.Conv1d):
-                         # Kaiming for Conv (Temporal) - THIS IS THE FIX
-                         nn.init.kaiming_normal_(sub_m.weight, mode='fan_out', nonlinearity='relu')
-                         if sub_m.bias is not None:
-                            nn.init.constant_(sub_m.bias, 0.0)
-                    elif isinstance(sub_m, nn.LayerNorm):
-                        nn.init.constant_(sub_m.bias, 0.0)
-                        nn.init.constant_(sub_m.weight, 1.0)      
+        # [REMOVED] _init_hyperbolic_modules call has been removed to match baseline behavior.
 
     def _encode_plain_text(self, tokenized_prompts):
         tokenized_prompts = tokenized_prompts.to(self.model_device)
@@ -211,6 +196,7 @@ class CustomCLIP(nn.Module):
         return self.text_encoder(x, tokenized_prompts)
 
     def set_hierarchy_prompts(self, coarse_verbs, coarse_objs, pairs):
+        # 这一部分是新加的功能，保留
         print(f"[CustomCLIP] Setting up hierarchy prompts...")
         self.coarse_verb_tokens = self.clip_tokenize([f"a photo of {v} something" for v in coarse_verbs])
         self.coarse_obj_tokens = self.clip_tokenize([f"a photo of something {o}" for o in coarse_objs])
@@ -245,22 +231,27 @@ class CustomCLIP(nn.Module):
         if self.coarse_verb_tokens is not None and "coarse_verb_backbone" not in self.cached_hierarchy:
             self._ensure_hierarchy_cached(device)
 
+        # 1. Text Features (Baseline Input)
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         obj_prompts = self.obj_prompt_learner()
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
 
+        # 2. Video Features (Baseline Input)
         video_features = self.video_encoder(video)
 
+        # 3. Hyperbolic Mapping (New Logic)
         with torch.cuda.amp.autocast(enabled=False):
-            # Clamp curvature (Standard Hyperbolic)
+            # Clamp curvature
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
             current_c = self.c_param.exp() 
             
+            # Cast to float for stability in Hyperbolic ops
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
             video_features = video_features.float()
 
+            # Projections
             verb_text_features = self.c2c_text_v(verb_text_features)
             obj_text_features = self.c2c_text_o(obj_text_features)
             o_feat = self.c2c_OE1(video_features.mean(dim=-1))
@@ -301,12 +292,15 @@ class CustomCLIP(nn.Module):
             comp_hyp_v = LorentzMath.exp_map_0(comp_v_euc, c=current_c)
             comp_hyp_o = LorentzMath.exp_map_0(comp_o_euc, c=current_c)
 
+            # Hyperbolic Distance
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
-            # [HyCoCLIP Style] Clamp Logit Scale
-            with torch.no_grad():
-                self.logit_scale.clamp_(max=4.6052)
+            # Logit Scale Handling
+            # 注意：这里我们使用继承自 CLIP 的 self.logit_scale，不使用 clamp_。
+            # 如果 HyCoCLIP 必须要求 max=4.6，你可以把下面这一行取消注释，但既然要求不动基线，最好先原样使用。
+            # with torch.no_grad(): self.logit_scale.clamp_(max=4.6052) 
+            
             logit_scale = self.logit_scale.exp()
             
             verb_logits = -dist_v * logit_scale
@@ -335,6 +329,7 @@ class CustomCLIP(nn.Module):
                 else:
                     return verb_logits, obj_logits
 
+
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
     url = clip._MODELS[backbone_name]
@@ -346,6 +341,7 @@ def load_clip_to_cpu(cfg):
         state_dict = torch.load(model_path, map_location="cpu")
     model = clip.build_model(state_dict or model.state_dict())
     return model
+
 
 def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
