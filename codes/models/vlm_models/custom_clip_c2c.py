@@ -1,17 +1,21 @@
 import torch
 import torch.nn as nn
-import math
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
+import math
 
 # [HYPERBOLIC] 引入双曲工具库
 import utils.hyperbolic_utils as L
 
 _tokenizer = _Tokenizer()
 
+
+# ==============================================================================
+# [Infrastructure] 基础组件保持原样，完全不修改
+# ==============================================================================
 
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -108,6 +112,10 @@ class VideoEncoder(nn.Module):
         return out
 
 
+# ==============================================================================
+# [Modification] 仅修改 CustomCLIP 以实现双曲迁移
+# ==============================================================================
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
@@ -117,12 +125,12 @@ class CustomCLIP(nn.Module):
         self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
         self.obj_tokenized_prompts = self.obj_prompt_learner.token_ids
 
-        # Encoders
+        # Encoders (Infrastructure preserved)
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
         
-        # [HYPERBOLIC] Removed scalar logit_scale in favor of distance based metric
-        # self.logit_scale = clip_model.logit_scale 
+        # [BASELINE] 必须保留 logit_scale，这在双曲空间同样用于缩放距离
+        self.logit_scale = clip_model.logit_scale
 
         # Independent Learning Modules
         try:
@@ -139,115 +147,90 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # =====================================================================
-        # [HYPERBOLIC] Initialization (Reference: HyCoCLIP/MERU)
-        # =====================================================================
+        # ----------------------------------------------------------------------
+        # [HYPERBOLIC] 新增参数初始化
+        # ----------------------------------------------------------------------
+        # 1. 曲率 Curvature (c)
         curv_init = 1.0
         self.curv = nn.Parameter(torch.tensor(math.log(curv_init)))
-        # Restrict curvature range to prevent instability
         self._curv_minmax = {
             "max": math.log(curv_init * 10),
             "min": math.log(curv_init / 10),
         }
 
-        # Learnable scalars to ensure that features have an expected unit norm 
-        # before exponential map. C2C splits Verb/Obj, so we need pairs.
+        # 2. 模长缩放因子 (Alpha)
+        # 用于在进入双曲空间前调整欧氏向量的模长，防止全部挤在原点或边缘
         embed_dim = cfg.emb_dim
+        init_scale_val = math.log(embed_dim**-0.5)
         
-        # For Video Features
-        self.visual_alpha_v = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
-        self.visual_alpha_o = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
-        
-        # For Text Features
-        self.text_alpha_v = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
-        self.text_alpha_o = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
-        # =====================================================================
+        self.visual_alpha_v = nn.Parameter(torch.tensor(init_scale_val))
+        self.visual_alpha_o = nn.Parameter(torch.tensor(init_scale_val))
+        self.text_alpha_v = nn.Parameter(torch.tensor(init_scale_val))
+        self.text_alpha_o = nn.Parameter(torch.tensor(init_scale_val))
 
     def forward(self, video, pairs=None):
-        # [HYPERBOLIC] Clamp curvature and alphas
+        # [HYPERBOLIC] 参数裁剪 (Stability)
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
         
-        # Clamp alphas (max=0.0 means scale <= 1.0)
+        # Alpha 限制 (max=0.0 表示缩放因子 <= 1.0)
         self.visual_alpha_v.data = torch.clamp(self.visual_alpha_v.data, max=0.0)
         self.visual_alpha_o.data = torch.clamp(self.visual_alpha_o.data, max=0.0)
         self.text_alpha_v.data = torch.clamp(self.text_alpha_v.data, max=0.0)
         self.text_alpha_o.data = torch.clamp(self.text_alpha_o.data, max=0.0)
 
-        # ---------------------------------------------------
-        # 1. Text Features (Euclidean -> Hyperbolic)
-        # ---------------------------------------------------
+        # ----------------------------------------------------------------------
+        # 1. 提取欧氏特征 (Pipeline 保持不变)
+        # ----------------------------------------------------------------------
+        # Text Features
         verb_prompts = self.verb_prompt_learner()
-        verb_text_features_euc = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
-        verb_text_features_euc = self.c2c_text_v(verb_text_features_euc)
+        verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
+        verb_text_features = self.c2c_text_v(verb_text_features)
 
         obj_prompts = self.obj_prompt_learner()
-        obj_text_features_euc = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
-        obj_text_features_euc = self.c2c_text_o(obj_text_features_euc)
-        
-        # [HYPERBOLIC] Map Text to Hyperbolic Space
-        # Step 1: Scale Euclidean vectors
-        verb_text_scaled = verb_text_features_euc * self.text_alpha_v.exp()
-        obj_text_scaled = obj_text_features_euc * self.text_alpha_o.exp()
-        
-        # Step 2: Exponential Map (Tangent -> Manifold)
-        verb_text_hyp = L.exp_map0(verb_text_scaled, _curv)
-        obj_text_hyp = L.exp_map0(obj_text_scaled, _curv)
+        obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
+        obj_text_features = self.c2c_text_o(obj_text_features)
 
-        # ---------------------------------------------------
-        # 2. Video Features (Euclidean -> Hyperbolic)
-        # ---------------------------------------------------
-        video_features_raw = self.video_encoder(video)
+        # Video Features
+        video_features = self.video_encoder(video)
 
-        # Video Object Feature (Mean Pooling -> MLP)
-        o_feat_euc = self.c2c_OE1(video_features_raw.mean(dim=-1))
-        
-        # Video Verb Feature (Conv1d -> Mean Pooling)
-        v_feat_t_euc = self.c2c_VE1(video_features_raw)
-        v_feat_euc = v_feat_t_euc.mean(dim=-1)
+        # Independent Learning (MLPs)
+        o_feat = self.c2c_OE1(video_features.mean(dim=-1))
+        v_feat_t = self.c2c_VE1(video_features)
+        v_feat = v_feat_t.mean(dim=-1)
 
-        # [HYPERBOLIC] Map Video to Hyperbolic Space
-        # Step 1: Scale
-        o_feat_scaled = o_feat_euc * self.visual_alpha_o.exp()
-        v_feat_scaled = v_feat_euc * self.visual_alpha_v.exp()
+        # ----------------------------------------------------------------------
+        # 2. [HYPERBOLIC] 空间映射 (关键修改点)
+        # ----------------------------------------------------------------------
+        # 逻辑：Feature * Alpha.exp() -> ExpMap -> Hyperbolic Space
         
-        # Step 2: Exp Map
-        o_feat_hyp = L.exp_map0(o_feat_scaled, _curv)
-        v_feat_hyp = L.exp_map0(v_feat_scaled, _curv)
+        # Text Mapping
+        verb_text_hyp = L.exp_map0(verb_text_features * self.text_alpha_v.exp(), _curv)
+        obj_text_hyp = L.exp_map0(obj_text_features * self.text_alpha_o.exp(), _curv)
+        
+        # Video Mapping
+        v_feat_hyp = L.exp_map0(v_feat * self.visual_alpha_v.exp(), _curv)
+        o_feat_hyp = L.exp_map0(o_feat * self.visual_alpha_o.exp(), _curv)
 
-        # ---------------------------------------------------
-        # 4. Logits Calculation (-Distance)
-        # ---------------------------------------------------
-        # NOTE: Original C2C used cosine similarity (dot product).
-        # Hyperbolic equivalent is negative distance.
-        # pairwise_dist returns distance >= 0. We negate it for compatibility with CrossEntropy.
+        # ----------------------------------------------------------------------
+        # 3. [HYPERBOLIC] Logits 计算 (距离替代相似度)
+        # ----------------------------------------------------------------------
+        # 原版是 @ .t() 点积，这里改为双曲距离
+        logit_scale = self.logit_scale.exp()
         
-        verb_logits = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
-        obj_logits = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
-        
-        # NOTE: C2C vanilla scaled logits: verb_logits * 0.5 + 0.5
-        # In hyperbolic, logits are unbounded negative numbers. Scaling is handled by Temperature in HyCoCLIP
-        # but here we output raw negative distances. The Loss function typically handles scaling (logit_scale).
-        # We will assume Loss function or external scalar handles it, OR we can apply a fixed scale here.
-        # HyCoCLIP applies `logit_scale` in the model forward. C2C applies it in the CLIP model but 
-        # custom_c2c replaced the head. 
-        # Let's keep raw negative distance here, compatible with `CrossEntropy`.
+        # 负距离作为 Logits (距离越小，相似度越高)
+        verb_logits = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv) * logit_scale
+        obj_logits = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv) * logit_scale
 
-        # ---------------------------------------------------
-        # 5. Composition (Sum of Logits / Product of Probabilities)
-        # ---------------------------------------------------
-        # P(v, o) = P(v) * P(o)
-        # log P(v, o) = log P(v) + log P(o)
-        # Since Logits ~ log P, we Sum the logits.
-        # verb_logits: [B, N_v], obj_logits: [B, N_o]
-        # pred_com: [B, N_v, N_o]
-        
+        # ----------------------------------------------------------------------
+        # 4. 组合逻辑
+        # ----------------------------------------------------------------------
+        # 原版: einsum (乘积)。 双曲/Logit空间: 加法 (Log P(v) + Log P(o))
         pred_com = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
 
         if self.training:
-            # [HYPERBOLIC] We return the features needed for Hierarchical Entailment Loss
-            # Pack them into a dictionary to avoid breaking `v, o, com = model()` unpacking if we can help it,
-            # BUT we HAVE to return 4 items now. The training loop MUST be updated.
+            # [ADDITION] 训练时必须返回双曲特征，供 Loss 使用
+            # 使用字典包裹，避免修改外层太多的解包逻辑
             hyperbolic_features = {
                 "v_feat_hyp": v_feat_hyp,
                 "o_feat_hyp": o_feat_hyp,
@@ -283,6 +266,7 @@ def build_model(train_dataset, cfg):
     model = CustomCLIP(cfg, train_dataset, clip_model)
 
     print("Turning off gradients in both the image and the text encoder")
+    # 梯度控制逻辑保持原样
     for name, param in model.named_parameters():
         param.requires_grad_(False)
         if "prompt_learner" in name:
@@ -290,22 +274,28 @@ def build_model(train_dataset, cfg):
                 if cfg.learn_input_method == 'coop':
                     if 'prompt_vectors' in name:
                         param.requires_grad_(True)
+                        print(f'{name}: {param.requires_grad}')
                 elif cfg.learn_input_method == 'csp':
                     if 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
                         param.requires_grad_(True)
+                        print(f'{name}: {param.requires_grad}')
                 elif cfg.learn_input_method == 'spm':
                     if 'prompt_vectors' in name or 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
                         param.requires_grad_(True)
+                        print(f'{name}: {param.requires_grad}')
                 else:
                     raise NotImplementedError
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
+                print(f'{name}: {param.requires_grad}')
         elif 'c2c' in name:
             param.requires_grad = True
-        # [HYPERBOLIC] Enable gradients for new parameters
+            print(f'{name}: {param.requires_grad}')
+            
+        # [HYPERBOLIC] 必须开启新参数的梯度
         elif 'curv' in name or 'alpha' in name:
             param.requires_grad = True
-            print(f'[Hyperbolic] Enable gradient for {name}')
+            print(f'[Hyperbolic Init] Enable gradient for {name}')
             
     return model
