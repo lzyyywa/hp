@@ -85,35 +85,49 @@ class MLP_ST(nn.Module):
 
 
 class TextEncoder(nn.Module):
+
     def __init__(self, cfg, clip_model):
+
         super().__init__()
+
         self.transformer = clip_model.transformer
+
         self.ln_final = clip_model.ln_final
+
         self.text_projection = clip_model.text_projection
-        
-        # [CRITICAL FIX: DYNAMIC MASKING]
-        # 保存原始的 77x77 Mask
+
         full_mask = self.transformer.resblocks[0].attn_mask.clone()
-        self.register_buffer('causal_mask', full_mask)
-            
+
+        self.register_buffer('full_causal_mask', full_mask)
+
         self.dtype = clip_model.dtype
 
+
+
     def forward(self, x, tokenized_prompts):
-        # [CRITICAL FIX: DYNAMIC MASKING]
-        x = x.permute(1, 0, 2) # [Length, Batch, Dim]
-        
-        L = x.shape[0] # 获取当前实际长度 (10 or 77)
-        
-        # 动态切片，确保 mask 尺寸与输入一致
-        current_mask = self.causal_mask[:L, :L]
-        
+
+        x = x.permute(1, 0, 2)  # [L, B, D]
+
+        L = x.shape[0]
+
+        temp_mask = self.full_causal_mask[:L, :L]
+
         for block in self.transformer.resblocks:
-            block.attn_mask = current_mask
-            
-        x = self.transformer(x)
+
+            original_mask = block.attn_mask
+
+            block.attn_mask = temp_mask
+
+            x = block(x)
+
+            block.attn_mask = original_mask
+
         x = x.permute(1, 0, 2)
+
         x = self.ln_final(x)
+
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
         return x
 
 
