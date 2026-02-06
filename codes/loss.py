@@ -1,172 +1,226 @@
-import torch
-import torch.nn as nn
+from torch.nn.modules.loss import CrossEntropyLoss
 import torch.nn.functional as F
-import math
+import torch.nn as nn
+import torch
+import numpy as np
 
-# [HyCoCLIP Alignment] Import correct ops
-try:
-    from utils.hyperbolic_ops import LorentzMath
-except ImportError:
-    print("Warning: Could not import LorentzMath. Hyperbolic losses will fail.")
+# [HYPERBOLIC] 引入双曲工具库
+import utils.hyperbolic_utils as L
 
-# ... [保留原本的 loss_calu, KLLoss 等 legacy 代码，不要动] ...
+# Code for "ActionCLIP: ActionCLIP: A New Paradigm for Action Recognition"
+# arXiv:
+# Mengmeng Wang, Jiazheng Xing, Yong Liu
 
-# =========================================================================
-# Hyperbolic Losses (Updated for H2EM Stability & Hard Negative Mining)
-# =========================================================================
+def loss_calu(predict, target, config):
+    loss_fn = CrossEntropyLoss()
+    batch_img, batch_attr, batch_obj, batch_target = target
+    batch_attr = batch_attr.cuda()
+    batch_obj = batch_obj.cuda()
+    batch_target = batch_target.cuda()
+    logits, logits_att, logits_obj, logits_soft_prompt = predict
+    loss_logit_df = loss_fn(logits, batch_target)
+    loss_logit_sp = loss_fn(logits_soft_prompt, batch_target)
+    loss_att = loss_fn(logits_att, batch_attr)
+    loss_obj = loss_fn(logits_obj, batch_obj)
+    loss = loss_logit_df + config.att_obj_w * (loss_att + loss_obj) + config.sp_w * loss_logit_sp
+    return loss
 
-class HyperbolicPrototypicalLoss(nn.Module):
-    """
-    Discriminative Loss in Hyperbolic Space.
-    """
-    def __init__(self):
-        super(HyperbolicPrototypicalLoss, self).__init__()
-        self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, query_emb, prototype_emb, targets, logit_scale=100.0, c=1.0):
-        # query: [B, D+1], prototype: [N, D+1]
-        q = query_emb.unsqueeze(1)  # [B, 1, D+1]
-        p = prototype_emb.unsqueeze(0)  # [1, N, D+1]
-        
-        # Calculate Hyperbolic Distance
-        # [Safe Guard] c must be positive
-        c = torch.clamp(c, min=1e-5)
-        dists = LorentzMath.hyp_distance(q, p, c=c)
-        
-        # Logits = -distance * scale
-        logits = -dists * logit_scale
-        
-        return self.loss_fn(logits, targets)
+# =============================================================================
+# [HYPERBOLIC] 新增损失函数组件
+# =============================================================================
 
 class EntailmentConeLoss(nn.Module):
     """
-    Hierarchical Entailment Cone Loss.
+    Hyperbolic Entailment Cone Loss.
+    Penalizes child embeddings that fall outside the entailment cone of their parent.
+    Reference: Ganea et al., "Hyperbolic Entailment Cones for Learning Hierarchical Embeddings"
     """
-    def __init__(self, min_radius=0.1, margin=0.01, aperture_scale=1.2):
-        super(EntailmentConeLoss, self).__init__()
-        self.min_radius = min_radius
+    def __init__(self, margin=0.01):
+        super().__init__()
         self.margin = margin
-        self.aperture_scale = aperture_scale 
 
-    def forward(self, child_emb, parent_emb, c=1.0):
-        c = torch.clamp(c, min=1e-5)
-        angle = LorentzMath.oxy_angle(parent_emb, child_emb, c=c)
-        dynamic_aperture = LorentzMath.half_aperture(parent_emb, c=c, min_radius=self.min_radius)
-        target_aperture = self.aperture_scale * dynamic_aperture
-        cone_loss = torch.clamp(angle - target_aperture + self.margin, min=0.0)
-        return cone_loss.mean()
-
-class H2EMTotalLoss(nn.Module):
-    """
-    H2EM Paper Eq. (16) Wrapper with HARD NEGATIVE MINING (Eq. 14).
-    """
-    def __init__(self, beta1=1.0, beta2=0.1, beta3=0.5, hard_neg_w=3.0):
-        super(H2EMTotalLoss, self).__init__()
-        self.beta1 = beta1   # Weight for L_DA
-        self.beta2 = beta2   # Weight for L_TE
-        self.beta3 = beta3   # Weight for L_prim
-        self.hard_neg_w = hard_neg_w # Weight w in Eq. 14 (default 3.0)
-        
-        self.loss_cls = HyperbolicPrototypicalLoss()
-        self.loss_cone = EntailmentConeLoss(min_radius=0.1, margin=0.01, aperture_scale=1.2)
-
-    def hard_negative_mining(self, logits, targets, p2v_map, p2o_map):
+    def forward(self, fine_emb, coarse_emb, curv):
         """
-        Implements H2EM Eq. 14: Discriminative Alignment Loss with Hard Negative Mining.
-        Instead of modifying the loss function formula directly, we add log(w) to the logits 
-        of hard negatives. This is mathematically equivalent to weighting them by w in the denominator.
-        
-        Hard Negatives: Compositions sharing the same state OR same object, excluding self.
+        Args:
+            fine_emb: (Batch, Dim) Child concept (e.g., specific action video feature)
+            coarse_emb: (Batch, Dim) Parent concept (e.g., coarse action text feature)
+            curv: curvature scalar
         """
-        B, NumPairs = logits.shape
-        device = logits.device
+        # Calculate the angle between the two points at the origin
+        angle = L.oxy_angle(coarse_emb, fine_emb, curv)
         
-        # 1. Get State and Object IDs for the current batch targets
-        # batch_states: [B], batch_objects: [B]
-        batch_states = p2v_map[targets]
-        batch_objects = p2o_map[targets]
+        # Calculate the aperture (half-angle) of the cone at the parent
+        # Note: aperture is determined by the norm of the parent
+        aperture = L.half_aperture(coarse_emb, curv)
         
-        # 2. Broadcast to create masks against all pairs
-        # all_states: [1, NumPairs]
-        all_states = p2v_map.unsqueeze(0)
-        all_objects = p2o_map.unsqueeze(0)
+        # Violation: if angle > aperture, the child is outside the cone.
+        # We minimize max(0, angle - aperture + margin)
+        violation = torch.clamp(angle - aperture + self.margin, min=0.0)
         
-        # 3. Identify Hard Negatives
-        # Mask: [B, NumPairs]
-        # Condition: (Same State OR Same Object)
-        is_hard = (all_states == batch_states.unsqueeze(1)) | (all_objects == batch_objects.unsqueeze(1))
-        
-        # 4. Exclude the Positive (Target) itself
-        # We don't want to penalize the correct class
-        target_mask = torch.arange(NumPairs, device=device).unsqueeze(0) == targets.unsqueeze(1)
-        is_hard = is_hard & (~target_mask)
-        
-        # 5. Apply Weighting
-        # Adding log(w) to logit is equivalent to multiplying exp(logit) by w
-        # Safe guard: w must be > 0.
-        w_log = math.log(max(self.hard_neg_w, 1.0))
-        
-        # Clone logits to avoid in-place modification errors in backward pass
-        weighted_logits = logits.clone()
-        weighted_logits[is_hard] += w_log
-        
-        return weighted_logits
+        return violation.mean()
 
-    def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
-        if not isinstance(out, dict):
-            raise TypeError(f"[H2EMTotalLoss] Expected 'out' to be a dict, got {type(out)}.")
 
-        v_feat_hyp = out['v_feat_hyp']
-        o_feat_hyp = out['o_feat_hyp']
-        verb_text_hyp = out['verb_text_hyp']
-        obj_text_hyp = out['obj_text_hyp']
-        coarse_verb_hyp = out['coarse_verb_hyp']
-        coarse_obj_hyp = out['coarse_obj_hyp']
-        
-        comp_hyp_v = out['comp_hyp_v'] 
-        comp_hyp_o = out['comp_hyp_o'] 
-        
-        verb_logits = out['verb_logits']
-        obj_logits = out['obj_logits']
-        
-        logit_scale = out['logit_scale']
-        current_c = out['curvature']
+def hyperbolic_loss_calu(predict, target, config):
+    """
+    专门用于双曲模式的损失计算函数
+    Predict: (verb_logits, obj_logits, com_logits, hyp_features)
+    Target: (batch_img, batch_attr, batch_obj, batch_target, coarse_v_hyp, coarse_o_hyp)
+    """
+    loss_fn = CrossEntropyLoss()
+    entail_loss_fn = EntailmentConeLoss(margin=0.01)
 
-        # -----------------------------------------------------------
-        # A. Primitive Auxiliary Loss (L_s + L_o)
-        # -----------------------------------------------------------
-        L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb, logit_scale, c=current_c)
-        L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj, logit_scale, c=current_c)
-        L_prim = L_s + L_o
+    # 1. Unpack Predictions
+    logits_v, logits_o, logits_com, hyp_feats = predict
+    
+    # 2. Unpack Targets
+    # 注意：train_models.py 需要被修改以传递 coarse_v_hyp 和 coarse_o_hyp
+    batch_img, batch_attr, batch_obj, batch_target, coarse_v_hyp, coarse_o_hyp = target
+    
+    batch_attr = batch_attr.cuda()
+    batch_obj = batch_obj.cuda()
+    batch_target = batch_target.cuda()
+    
+    # 3. Discriminative Alignment Loss (判别对齐损失)
+    # 在双曲空间中，Logits = -Distance * Scale。
+    # CrossEntropyLoss = -log(softmax(logits)) = -log(softmax(-dist))
+    # 最小化 CE Loss 等价于最大化正确类别的 Logit (即最小化距离)。
+    # 这自然实现了 "Aligning fine-grained video features with fine-grained text features"
+    loss_com = loss_fn(logits_com, batch_target)
+    loss_v = loss_fn(logits_v, batch_attr)
+    loss_o = loss_fn(logits_o, batch_obj)
+    
+    # 4. Hierarchical Entailment Loss (层次蕴含损失)
+    # 约束：Fine Video Feature 应当位于 Coarse Text Feature 的蕴含锥内
+    curv = hyp_feats['curv']
+    
+    # Video-Verb Fine vs Text-Verb Coarse
+    loss_entail_v = entail_loss_fn(hyp_feats['v_feat_hyp'], coarse_v_hyp, curv)
+    # Video-Obj Fine vs Text-Obj Coarse
+    loss_entail_o = entail_loss_fn(hyp_feats['o_feat_hyp'], coarse_o_hyp, curv)
+    
+    loss_entail = loss_entail_v + loss_entail_o
 
-        # -----------------------------------------------------------
-        # B. Discriminative Alignment Loss (L_DA) with Hard Negative Mining
-        # -----------------------------------------------------------
-        # Base Logits (Additive Fusion)
-        pair_logits = verb_logits[:, p2v_map] + obj_logits[:, p2o_map]
-        
-        # [CRITICAL FIX] Apply Hard Negative Mining
-        weighted_pair_logits = self.hard_negative_mining(pair_logits, batch_target, p2v_map, p2o_map)
-        
-        L_DA = F.cross_entropy(weighted_pair_logits, batch_target)
+    # 5. Total Loss
+    # 获取权重参数，如果 config 中没有定义则使用默认值
+    lambda_entail = getattr(config, 'lambda_entail', 0.1) 
+    
+    # C2C 原始结构: Composition + 0.2 * (Verb + Obj)
+    # 新增: + lambda * Entailment
+    loss = loss_com + config.att_obj_w * (loss_v + loss_o) + lambda_entail * loss_entail
+    
+    return loss
 
-        # -----------------------------------------------------------
-        # C. Taxonomic Entailment Loss (L_TE)
-        # -----------------------------------------------------------
-        loss_h1 = self.loss_cone(child_emb=verb_text_hyp, parent_emb=coarse_verb_hyp[v2cv_map], c=current_c)
-        loss_h2 = self.loss_cone(child_emb=obj_text_hyp, parent_emb=coarse_obj_hyp[o2co_map], c=current_c)
-        loss_h3 = self.loss_cone(child_emb=comp_hyp_v, parent_emb=verb_text_hyp[p2v_map], c=current_c)
-        loss_h4 = self.loss_cone(child_emb=comp_hyp_o, parent_emb=obj_text_hyp[p2o_map], c=current_c)
-        
-        L_TE = loss_h1 + loss_h2 + loss_h3 + loss_h4
 
-        # Total Loss
-        loss = self.beta1 * L_DA + self.beta2 * L_TE + self.beta3 * L_prim
-        
-        return loss, {
-            "Total": loss.item(),
-            "Prim": L_prim.item(),
-            "DA": L_DA.item(),
-            "TE": L_TE.item(),
-            "Curvature": current_c.item() if isinstance(current_c, torch.Tensor) else current_c
-        }
+# =============================================================================
+# Original Utils (Preserved)
+# =============================================================================
+
+class KLLoss(nn.Module):
+    """Loss that uses a 'hinge' on the lower bound.
+    This means that for samples with a label value smaller than the threshold, the loss is zero if the prediction is
+    also smaller than that threshold.
+    args:
+        error_matric:  What base loss to use (MSE by default).
+        threshold:  Threshold to use for the hinge.
+        clip:  Clip the loss if it is above this value.
+    """
+
+    def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
+        super().__init__()
+        print('=========using KL Loss=and has temperature and * bz==========')
+        self.error_metric = error_metric
+
+    def forward(self, prediction, label,mul=False):
+        batch_size = prediction.shape[0]
+        probs1 = F.log_softmax(prediction, 1)
+        probs2 = F.softmax(label, 1)
+        loss = self.error_metric(probs1, probs2)
+        if mul:
+            return loss* batch_size
+        else:
+            return loss
+
+
+def hsic_loss(input1, input2, unbiased=False):
+    def _kernel(X, sigma):
+        X = X.view(len(X), -1)
+        XX = X @ X.t()
+        X_sqnorms = torch.diag(XX)
+        X_L2 = -2 * XX + X_sqnorms.unsqueeze(1) + X_sqnorms.unsqueeze(0)
+        gamma = 1 / (2 * sigma ** 2)
+
+        kernel_XX = torch.exp(-gamma * X_L2)
+        return kernel_XX
+
+    N = len(input1)
+    if N < 4:
+        return torch.tensor(0.0).to(input1.device)
+    # we simply use the squared dimension of feature as the sigma for RBF kernel
+    sigma_x = np.sqrt(input1.size()[1])
+    sigma_y = np.sqrt(input2.size()[1])
+
+    # compute the kernels
+    kernel_XX = _kernel(input1, sigma_x)
+    kernel_YY = _kernel(input2, sigma_y)
+
+    if unbiased:
+        """Unbiased estimator of Hilbert-Schmidt Independence Criterion
+        Song, Le, et al. "Feature selection via dependence maximization." 2012.
+        """
+        # tK = kernel_XX - torch.diag(torch.diag(kernel_XX))
+        # tL = kernel_YY - torch.diag(torch.diag(kernel_YY))
+        tK = kernel_XX - torch.diag(kernel_XX)
+        tL = kernel_YY - torch.diag(kernel_YY)
+        hsic = (
+                torch.trace(tK @ tL)
+                + (torch.sum(tK) * torch.sum(tL) / (N - 1) / (N - 2))
+                - (2 * torch.sum(tK, 0).dot(torch.sum(tL, 0)) / (N - 2))
+        )
+        loss = hsic / (N * (N - 3))
+    else:
+        """Biased estimator of Hilbert-Schmidt Independence Criterion
+        Gretton, Arthur, et al. "Measuring statistical dependence with Hilbert-Schmidt norms." 2005.
+        """
+        KH = kernel_XX - kernel_XX.mean(0, keepdim=True)
+        LH = kernel_YY - kernel_YY.mean(0, keepdim=True)
+        loss = torch.trace(KH @ LH / (N - 1) ** 2)
+    return loss
+
+
+class Gml_loss(nn.Module):
+    """Loss that uses a 'hinge' on the lower bound.
+    Loss from No One Left Behind: Improving the Worst Categories in Long-Tailed Learning
+    """
+
+    def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
+        super().__init__()
+
+    def forward(self, p_o_on_v, v_label, n_c, t=100.0):
+        '''
+
+        Args:
+            p_o_on_v: b,n_v,n_o
+            o_label: b,
+            n_c: b,n_o
+
+        Returns:
+
+        '''
+        n_c = n_c[:, 0]
+        b = p_o_on_v.shape[0]
+        n_o = p_o_on_v.shape[-1]
+        p_o = p_o_on_v[range(b), v_label, :]  # b,n_o
+
+        num_c = n_c.sum().view(1, -1)  # 1,n_o
+
+        p_o_exp = torch.exp(p_o * t)
+        p_o_exp_wed = num_c * p_o_exp  # b,n_o
+        p_phi = p_o_exp_wed / torch.sum(p_o_exp_wed, dim=0, keepdim=True)  # b,n_o
+
+        p_ba = torch.sum(p_phi * n_c, dim=0, keepdim=True) / (num_c + 1.0e-6)  # 1,n_o
+        p_ba[torch.where(p_ba < 1.0e-8)] = 1.0
+        p_ba_log = torch.log(p_ba)
+        loss = (-1.0 / n_o) * p_ba_log.sum()
+
+        return loss
