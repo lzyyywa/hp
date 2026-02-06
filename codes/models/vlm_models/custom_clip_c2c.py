@@ -148,12 +148,14 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
 
         # Hyperbolic Parameters
+        # 你的原本设置
         self.c_param = nn.Parameter(torch.tensor(1.0).log())
         self._curv_minmax = {
             "max": math.log(10.0), 
             "min": math.log(1e-7),
         }
 
+        # 保持你的 HyCoCLIP 风格初始化
         init_alpha = 1.0 / (float(cfg.emb_dim) ** 0.5)
         self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
@@ -241,6 +243,11 @@ class CustomCLIP(nn.Module):
 
         # 3. Hyperbolic Mapping
         with torch.cuda.amp.autocast(enabled=False):
+            # === [IMPORTANT FIX 1] CLAMP LOGIT SCALE ===
+            # CLIP 默认 scale 非常大，双曲距离对 scale 敏感，必须锁死在 4.6 (≈ln(100)) 以内
+            self.logit_scale.data = torch.clamp(self.logit_scale.data, max=4.6052)
+            logit_scale = self.logit_scale.exp()
+
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
             current_c = self.c_param.exp() 
             
@@ -263,8 +270,11 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
-            # [CRITICAL FIX] 必须在进入双曲空间前进行归一化！
-            # 这能消除 MLP 带来的随机模长噪声，让 Alpha 真正控制双曲半径
+            # === [IMPORTANT FIX 2] Normalize + Alpha Scaling ===
+            # 你之前的代码有 F.normalize，但没有把 alpha 乘上去。
+            # HyCoCLIP 的核心就是：点很靠近原点 (Norm=1 * alpha=0.04) + 限制 Scale (max=100)
+            
+            # 1. 先做归一化
             verb_text_features = F.normalize(verb_text_features, dim=-1)
             obj_text_features = F.normalize(obj_text_features, dim=-1)
             o_feat = F.normalize(o_feat, dim=-1)
@@ -275,7 +285,7 @@ class CustomCLIP(nn.Module):
             comp_v_euc = F.normalize(comp_v_euc, dim=-1)
             comp_o_euc = F.normalize(comp_o_euc, dim=-1)
 
-            # Soft Scaling (Alpha)
+            # 2. 乘上 Alpha (Radius)
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
@@ -303,8 +313,7 @@ class CustomCLIP(nn.Module):
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
-            logit_scale = self.logit_scale.exp()
-            
+            # 使用前面已经 clamp 过的 logit_scale
             verb_logits = -dist_v * logit_scale
             obj_logits = -dist_o * logit_scale
 
