@@ -23,7 +23,7 @@ import yaml
 cudnn.benchmark = True
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
+DIR_PATH = os.path.dirname(os.path.realpath(__file__)) # 恢复基线中可能用到的路径变量
 
 class Evaluator:
     """
@@ -337,13 +337,11 @@ def predict_logits(model, dataset, config):
                 batch_img_f32 = batch_img.float() 
                 
                 # Forward pass
-                # Note: Model should return (Batch, NumPairs) logits
                 predict = model(batch_img_f32, pairs.repeat(torch.cuda.device_count(), 1)) 
 
             logits = predict.float() # Ensure output is float32
             
             # Loss calc (Optional, just for monitoring)
-            # Make sure targets are valid
             if batch_target.max() < predict.shape[1]:
                  loss += loss_fn(predict, batch_target)
 
@@ -477,29 +475,62 @@ if __name__ == "__main__":
 
     print('evaluating on the validation set')
     if config.open_world and config.threshold is None:
+        # [RESTORED] Baseline Feasibility Search Logic
         evaluator = Evaluator(val_dataset, model=None)
-        # (Feasibility logic kept as is)
-        pass 
-        # Note: If you need open world thresholding, ensure feasibility scores are also valid
-        # For now, sticking to closed/unbiased closed metrics which are standard.
+        feasibility_path = os.path.join(
+            DIR_PATH, f'data/feasibility_{config.dataset}.pt')
         
-        # Simplified evaluation call for validation
-        with torch.no_grad():
-            all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = predict_logits(
-                model, val_dataset, config)
-            results = test(
-                val_dataset,
-                evaluator,
-                all_logits,
-                all_attr_gt,
-                all_obj_gt,
-                all_pair_gt,
-                config
-            )
-        val_stats = copy.deepcopy(results)
+        # Safety check for file existence
+        if os.path.exists(feasibility_path):
+            unseen_scores = torch.load(
+                feasibility_path,
+                map_location='cpu')['feasibility']
+            seen_mask = val_dataset.seen_mask.to('cpu')
+            min_feasibility = (unseen_scores + seen_mask * 10.).min()
+            max_feasibility = (unseen_scores - seen_mask * 10.).max()
+            thresholds = np.linspace(
+                min_feasibility,
+                max_feasibility,
+                num=config.threshold_trials)
+            best_auc = 0.
+            best_th = -10
+            val_stats = None
+            with torch.no_grad():
+                all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = predict_logits(
+                    model, val_dataset, config)
+                for th in thresholds:
+                    temp_logits = threshold_with_feasibility(
+                        all_logits, val_dataset.seen_mask, threshold=th, feasiblity=unseen_scores)
+                    results = test(
+                        val_dataset,
+                        evaluator,
+                        temp_logits,
+                        all_attr_gt,
+                        all_obj_gt,
+                        all_pair_gt,
+                        config
+                    )
+                    auc = results['AUC']
+                    if auc > best_auc:
+                        best_auc = auc
+                        best_th = th
+                        print('New best AUC', best_auc)
+                        print('Threshold', best_th)
+                        val_stats = copy.deepcopy(results)
+        else:
+            print(f"Warning: Feasibility file not found at {feasibility_path}. Skipping threshold search.")
+            best_th = None
+            # Fallback to standard eval
+            with torch.no_grad():
+                all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = predict_logits(
+                    model, val_dataset, config)
+                results = test(val_dataset, evaluator, all_logits, all_attr_gt, all_obj_gt, all_pair_gt, config)
+            val_stats = copy.deepcopy(results)
+            
         result = ""
-        for key in val_stats:
-            result = result + key + "  " + str(round(val_stats[key], 4)) + "| "
+        if val_stats:
+            for key in val_stats:
+                result = result + key + "  " + str(round(val_stats[key], 4)) + "| "
         print(result)
         
     else:
@@ -508,6 +539,9 @@ if __name__ == "__main__":
         with torch.no_grad():
             all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = predict_logits(
                 model, val_dataset, config)
+            if config.open_world and best_th is not None:
+                # Optional: apply threshold if explicit
+                 pass 
             results = test(
                 val_dataset,
                 evaluator,
@@ -528,6 +562,19 @@ if __name__ == "__main__":
         evaluator = Evaluator(test_dataset, model=None)
         all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = predict_logits(
             model, test_dataset, config)
+        
+        # Apply best threshold if found
+        if config.open_world and best_th is not None:
+             feasibility_path = os.path.join(DIR_PATH, f'data/feasibility_{config.dataset}.pt')
+             if os.path.exists(feasibility_path):
+                print('using threshold: ', best_th)
+                unseen_scores = torch.load(feasibility_path, map_location='cpu')['feasibility']
+                all_logits = threshold_with_feasibility(
+                    all_logits,
+                    test_dataset.seen_mask,
+                    threshold=best_th,
+                    feasiblity=unseen_scores)
+
         test_stats = test(
             test_dataset,
             evaluator,
@@ -548,6 +595,9 @@ if __name__ == "__main__":
         'val': val_stats,
         'test': test_stats,
     }
+
+    if best_th is not None:
+        results['best_threshold'] = best_th
 
     if config.open_world:
         result_path = config.load_model[:-2] + "open.calibrated.json"
