@@ -1,18 +1,14 @@
 import torch
 import torch.nn as nn
+import math
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
-import math
 
-# [HyCoCLIP Requirement]
-try:
-    from utils.hyperbolic_ops import LorentzMath
-except ImportError:
-    print("[Error] Could not import LorentzMath! Please check your path.")
-    exit(1)
+# [HYPERBOLIC] 引入双曲工具库
+import utils.hyperbolic_utils as L
 
 _tokenizer = _Tokenizer()
 
@@ -27,18 +23,14 @@ class MLP(nn.Module):
                 outgoing = incoming
             else:
                 outgoing = layers[layer_ind]
-            
             mod.append(nn.Linear(incoming, outgoing, bias=bias))
-            
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
-    
         mod.append(nn.Linear(incoming, out_dim, bias=bias))
-        
         if relu:
             mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
@@ -57,18 +49,14 @@ class MLP_ST(nn.Module):
                 outgoing = incoming
             else:
                 outgoing = layers[layer_ind]
-            
             mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
-            
             incoming = outgoing
             if norm:
                 mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
             if dropout:
                 mod.append(nn.Dropout(p=0.5))
-        
         mod.append(nn.Conv1d(incoming, out_dim, kernel_size=3, bias=bias, padding=1))
-        
         if relu:
             mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
@@ -85,49 +73,22 @@ class MLP_ST(nn.Module):
 
 
 class TextEncoder(nn.Module):
-
     def __init__(self, cfg, clip_model):
-
         super().__init__()
-
         self.transformer = clip_model.transformer
-
         self.ln_final = clip_model.ln_final
-
         self.text_projection = clip_model.text_projection
 
-        full_mask = self.transformer.resblocks[0].attn_mask.clone()
-
-        self.register_buffer('full_causal_mask', full_mask)
-
+        for block in self.transformer.resblocks:
+            block.attn_mask = block.attn_mask[:cfg.ctx_length, :cfg.ctx_length]
         self.dtype = clip_model.dtype
 
-
-
     def forward(self, x, tokenized_prompts):
-
-        x = x.permute(1, 0, 2)  # [L, B, D]
-
-        L = x.shape[0]
-
-        temp_mask = self.full_causal_mask[:L, :L]
-
-        for block in self.transformer.resblocks:
-
-            original_mask = block.attn_mask
-
-            block.attn_mask = temp_mask
-
-            x = block(x)
-
-            block.attn_mask = original_mask
-
         x = x.permute(1, 0, 2)
-
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
         x = self.ln_final(x)
-
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
         return x
 
 
@@ -150,42 +111,26 @@ class VideoEncoder(nn.Module):
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
+        # Text Prompt Learners
         self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
         self.verb_tokenized_prompts = self.verb_prompt_learner.token_ids
         self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
         self.obj_tokenized_prompts = self.obj_prompt_learner.token_ids
 
+        # Encoders
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
+        
+        # [HYPERBOLIC] Removed scalar logit_scale in favor of distance based metric
+        # self.logit_scale = clip_model.logit_scale 
 
-        # Baseline Parameters
-        self.logit_scale = clip_model.logit_scale
-
-        # Hyperbolic Parameters
-        # 你的原本设置
-        self.c_param = nn.Parameter(torch.tensor(1.0).log())
-        self._curv_minmax = {
-            "max": math.log(10.0), 
-            "min": math.log(1e-7),
-        }
-
-        # 保持你的 HyCoCLIP 风格初始化
-        init_alpha = 1.0 / (float(cfg.emb_dim) ** 0.5)
-        self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
-        self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
-
+        # Independent Learning Modules
         try:
             fc_emb = cfg.fc_emb.split(',')
         except:
             fc_emb = [cfg.fc_emb]
-        
-        layers = []
-        if isinstance(fc_emb, list) and len(fc_emb) == 1 and fc_emb[0] == '':
-             layers = []
-        else:
-             layers = [int(a) for a in fc_emb if a != '']
+        layers = [int(a) for a in fc_emb]
 
-        # Independent Learning Modules
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                            dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
@@ -194,165 +139,127 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        self.cached_hierarchy = {} 
-        self.clip_tokenize = clip.tokenize
-        self.token_embedding = clip_model.token_embedding
-        self.positional_embedding = clip_model.positional_embedding
-        self.model_device = next(self.parameters()).device
+        # =====================================================================
+        # [HYPERBOLIC] Initialization (Reference: HyCoCLIP/MERU)
+        # =====================================================================
+        curv_init = 1.0
+        self.curv = nn.Parameter(torch.tensor(math.log(curv_init)))
+        # Restrict curvature range to prevent instability
+        self._curv_minmax = {
+            "max": math.log(curv_init * 10),
+            "min": math.log(curv_init / 10),
+        }
 
-    def _encode_plain_text(self, tokenized_prompts):
-        tokenized_prompts = tokenized_prompts.to(self.model_device)
-        x = self.token_embedding(tokenized_prompts).type(self.text_encoder.dtype)
-        # CLIP's positional embedding is 77 max length
-        x = x + self.positional_embedding[:x.shape[1], :].type(self.text_encoder.dtype)
-        return self.text_encoder(x, tokenized_prompts)
-
-    def set_hierarchy_prompts(self, coarse_verbs, coarse_objs, pairs):
-        print(f"[CustomCLIP] Setting up hierarchy prompts...")
-        # These are length 77 by default
-        self.coarse_verb_tokens = self.clip_tokenize([f"a photo of {v} something" for v in coarse_verbs])
-        self.coarse_obj_tokens = self.clip_tokenize([f"a photo of something {o}" for o in coarse_objs])
-        pair_texts = [f"a photo of {v} {o}" for v, o in pairs]
-        self.comp_tokens = self.clip_tokenize(pair_texts)
-        print(f"[CustomCLIP] Ready to cache.")
-
-    def _ensure_hierarchy_cached(self, device):
-        if "coarse_verb_backbone" in self.cached_hierarchy:
-            return 
-        print(f"[CustomCLIP] Caching BACKBONE outputs (Frozen) on {device}...")
-        self.model_device = device
-        with torch.no_grad():
-            cv_backbone = self._encode_plain_text(self.coarse_verb_tokens)
-            self.cached_hierarchy["coarse_verb_backbone"] = cv_backbone.float()
-            co_backbone = self._encode_plain_text(self.coarse_obj_tokens)
-            self.cached_hierarchy["coarse_obj_backbone"] = co_backbone.float()
-            batch_size = 500
-            comp_embs = []
-            total = self.comp_tokens.shape[0]
-            for i in range(0, total, batch_size):
-                batch_tokens = self.comp_tokens[i : i + batch_size]
-                emb = self._encode_plain_text(batch_tokens)
-                comp_embs.append(emb.cpu())
-            comp_emb_all = torch.cat(comp_embs, dim=0).to(device)
-            self.cached_hierarchy["comp_backbone"] = comp_emb_all.float()
-        print(f"[CustomCLIP] Backbone Cache finished.")
+        # Learnable scalars to ensure that features have an expected unit norm 
+        # before exponential map. C2C splits Verb/Obj, so we need pairs.
+        embed_dim = cfg.emb_dim
+        
+        # For Video Features
+        self.visual_alpha_v = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
+        self.visual_alpha_o = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
+        
+        # For Text Features
+        self.text_alpha_v = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
+        self.text_alpha_o = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
+        # =====================================================================
 
     def forward(self, video, pairs=None):
-        device = video.device
+        # [HYPERBOLIC] Clamp curvature and alphas
+        self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
+        _curv = self.curv.exp()
         
-        if self.coarse_verb_tokens is not None and "coarse_verb_backbone" not in self.cached_hierarchy:
-            self._ensure_hierarchy_cached(device)
+        # Clamp alphas (max=0.0 means scale <= 1.0)
+        self.visual_alpha_v.data = torch.clamp(self.visual_alpha_v.data, max=0.0)
+        self.visual_alpha_o.data = torch.clamp(self.visual_alpha_o.data, max=0.0)
+        self.text_alpha_v.data = torch.clamp(self.text_alpha_v.data, max=0.0)
+        self.text_alpha_o.data = torch.clamp(self.text_alpha_o.data, max=0.0)
 
-        # 1. Text Features (Input Length = 10)
+        # ---------------------------------------------------
+        # 1. Text Features (Euclidean -> Hyperbolic)
+        # ---------------------------------------------------
         verb_prompts = self.verb_prompt_learner()
-        # mask will dynamically slice to 10
-        verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
-        
+        verb_text_features_euc = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
+        verb_text_features_euc = self.c2c_text_v(verb_text_features_euc)
+
         obj_prompts = self.obj_prompt_learner()
-        # mask will dynamically slice to 10
-        obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
+        obj_text_features_euc = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
+        obj_text_features_euc = self.c2c_text_o(obj_text_features_euc)
+        
+        # [HYPERBOLIC] Map Text to Hyperbolic Space
+        # Step 1: Scale Euclidean vectors
+        verb_text_scaled = verb_text_features_euc * self.text_alpha_v.exp()
+        obj_text_scaled = obj_text_features_euc * self.text_alpha_o.exp()
+        
+        # Step 2: Exponential Map (Tangent -> Manifold)
+        verb_text_hyp = L.exp_map0(verb_text_scaled, _curv)
+        obj_text_hyp = L.exp_map0(obj_text_scaled, _curv)
 
-        # 2. Video Features
-        video_features = self.video_encoder(video)
+        # ---------------------------------------------------
+        # 2. Video Features (Euclidean -> Hyperbolic)
+        # ---------------------------------------------------
+        video_features_raw = self.video_encoder(video)
 
-        # 3. Hyperbolic Mapping
-        with torch.cuda.amp.autocast(enabled=False):
-            # === [IMPORTANT FIX 1] CLAMP LOGIT SCALE ===
-            # CLIP 默认 scale 非常大，双曲距离对 scale 敏感，必须锁死在 4.6 (≈ln(100)) 以内
-            self.logit_scale.data = torch.clamp(self.logit_scale.data, max=4.6052)
-            logit_scale = self.logit_scale.exp()
+        # Video Object Feature (Mean Pooling -> MLP)
+        o_feat_euc = self.c2c_OE1(video_features_raw.mean(dim=-1))
+        
+        # Video Verb Feature (Conv1d -> Mean Pooling)
+        v_feat_t_euc = self.c2c_VE1(video_features_raw)
+        v_feat_euc = v_feat_t_euc.mean(dim=-1)
 
-            self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
-            current_c = self.c_param.exp() 
-            
-            verb_text_features = verb_text_features.float()
-            obj_text_features = obj_text_features.float()
-            video_features = video_features.float()
+        # [HYPERBOLIC] Map Video to Hyperbolic Space
+        # Step 1: Scale
+        o_feat_scaled = o_feat_euc * self.visual_alpha_o.exp()
+        v_feat_scaled = v_feat_euc * self.visual_alpha_v.exp()
+        
+        # Step 2: Exp Map
+        o_feat_hyp = L.exp_map0(o_feat_scaled, _curv)
+        v_feat_hyp = L.exp_map0(v_feat_scaled, _curv)
 
-            verb_text_features = self.c2c_text_v(verb_text_features)
-            obj_text_features = self.c2c_text_o(obj_text_features)
-            o_feat = self.c2c_OE1(video_features.mean(dim=-1))
-            v_feat_t = self.c2c_VE1(video_features)
-            v_feat = v_feat_t.mean(dim=-1)
+        # ---------------------------------------------------
+        # 4. Logits Calculation (-Distance)
+        # ---------------------------------------------------
+        # NOTE: Original C2C used cosine similarity (dot product).
+        # Hyperbolic equivalent is negative distance.
+        # pairwise_dist returns distance >= 0. We negate it for compatibility with CrossEntropy.
+        
+        verb_logits = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
+        obj_logits = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
+        
+        # NOTE: C2C vanilla scaled logits: verb_logits * 0.5 + 0.5
+        # In hyperbolic, logits are unbounded negative numbers. Scaling is handled by Temperature in HyCoCLIP
+        # but here we output raw negative distances. The Loss function typically handles scaling (logit_scale).
+        # We will assume Loss function or external scalar handles it, OR we can apply a fixed scale here.
+        # HyCoCLIP applies `logit_scale` in the model forward. C2C applies it in the CLIP model but 
+        # custom_c2c replaced the head. 
+        # Let's keep raw negative distance here, compatible with `CrossEntropy`.
 
-            cv_backbone = self.cached_hierarchy["coarse_verb_backbone"]
-            co_backbone = self.cached_hierarchy["coarse_obj_backbone"]
-            comp_backbone = self.cached_hierarchy["comp_backbone"]
+        # ---------------------------------------------------
+        # 5. Composition (Sum of Logits / Product of Probabilities)
+        # ---------------------------------------------------
+        # P(v, o) = P(v) * P(o)
+        # log P(v, o) = log P(v) + log P(o)
+        # Since Logits ~ log P, we Sum the logits.
+        # verb_logits: [B, N_v], obj_logits: [B, N_o]
+        # pred_com: [B, N_v, N_o]
+        
+        pred_com = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
 
-            cv_euc = self.c2c_text_v(cv_backbone)
-            co_euc = self.c2c_text_o(co_backbone)
-            comp_v_euc = self.c2c_text_v(comp_backbone)
-            comp_o_euc = self.c2c_text_o(comp_backbone)
-
-            # === [IMPORTANT FIX 2] Normalize + Alpha Scaling ===
-            # 你之前的代码有 F.normalize，但没有把 alpha 乘上去。
-            # HyCoCLIP 的核心就是：点很靠近原点 (Norm=1 * alpha=0.04) + 限制 Scale (max=100)
-            
-            # 1. 先做归一化
-            verb_text_features = F.normalize(verb_text_features, dim=-1)
-            obj_text_features = F.normalize(obj_text_features, dim=-1)
-            o_feat = F.normalize(o_feat, dim=-1)
-            v_feat = F.normalize(v_feat, dim=-1)
-
-            cv_euc = F.normalize(cv_euc, dim=-1)
-            co_euc = F.normalize(co_euc, dim=-1)
-            comp_v_euc = F.normalize(comp_v_euc, dim=-1)
-            comp_o_euc = F.normalize(comp_o_euc, dim=-1)
-
-            # 2. 乘上 Alpha (Radius)
-            v_scale = self.visual_alpha.exp()
-            t_scale = self.textual_alpha.exp()
-            
-            verb_text_features = verb_text_features * t_scale
-            obj_text_features = obj_text_features * t_scale
-            o_feat = o_feat * v_scale
-            v_feat = v_feat * v_scale
-
-            cv_euc = cv_euc * t_scale
-            co_euc = co_euc * t_scale
-            comp_v_euc = comp_v_euc * t_scale
-            comp_o_euc = comp_o_euc * t_scale
-
-            # Map to Hyperbolic
-            verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
-            obj_text_hyp = LorentzMath.exp_map_0(obj_text_features, c=current_c)
-            o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
-            v_feat_hyp = LorentzMath.exp_map_0(v_feat, c=current_c)
-
-            coarse_verb_hyp = LorentzMath.exp_map_0(cv_euc, c=current_c)
-            coarse_obj_hyp  = LorentzMath.exp_map_0(co_euc, c=current_c)
-            comp_hyp_v = LorentzMath.exp_map_0(comp_v_euc, c=current_c)
-            comp_hyp_o = LorentzMath.exp_map_0(comp_o_euc, c=current_c)
-
-            dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
-            dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
-            
-            # 使用前面已经 clamp 过的 logit_scale
-            verb_logits = -dist_v * logit_scale
-            obj_logits = -dist_o * logit_scale
-
-            if self.training:
-                return {
-                    "verb_logits": verb_logits,
-                    "obj_logits": obj_logits,
-                    "v_feat_hyp": v_feat_hyp,
-                    "o_feat_hyp": o_feat_hyp,
-                    "verb_text_hyp": verb_text_hyp,
-                    "obj_text_hyp": obj_text_hyp,
-                    "coarse_verb_hyp": coarse_verb_hyp,
-                    "coarse_obj_hyp": coarse_obj_hyp,
-                    "comp_hyp_v": comp_hyp_v,  
-                    "comp_hyp_o": comp_hyp_o,
-                    "logit_scale": logit_scale,
-                    "curvature": current_c  
-                }
-            else:
-                if pairs is not None:
-                    verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                    combined_logits = verb_logits[:, verb_idx] + obj_logits[:, obj_idx]
-                    return combined_logits 
-                else:
-                    return verb_logits, obj_logits
+        if self.training:
+            # [HYPERBOLIC] We return the features needed for Hierarchical Entailment Loss
+            # Pack them into a dictionary to avoid breaking `v, o, com = model()` unpacking if we can help it,
+            # BUT we HAVE to return 4 items now. The training loop MUST be updated.
+            hyperbolic_features = {
+                "v_feat_hyp": v_feat_hyp,
+                "o_feat_hyp": o_feat_hyp,
+                "verb_text_hyp": verb_text_hyp,
+                "obj_text_hyp": obj_text_hyp,
+                "curv": _curv
+            }
+            return verb_logits, obj_logits, pred_com, hyperbolic_features
+        else:
+            verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
+            com_logits = pred_com[:, verb_idx, obj_idx]
+            return com_logits
 
 
 def load_clip_to_cpu(cfg):
@@ -372,8 +279,10 @@ def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-    print("Building custom CLIP (Hyperbolic Version - HyCoCLIP Aligned)")
+    print("Building custom CLIP (Hyperbolic C2C Version)")
     model = CustomCLIP(cfg, train_dataset, clip_model)
+
+    print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():
         param.requires_grad_(False)
         if "prompt_learner" in name:
@@ -381,26 +290,22 @@ def build_model(train_dataset, cfg):
                 if cfg.learn_input_method == 'coop':
                     if 'prompt_vectors' in name:
                         param.requires_grad_(True)
-                        print(f'{name}: {param.requires_grad}')
                 elif cfg.learn_input_method == 'csp':
                     if 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
                         param.requires_grad_(True)
-                        print(f'{name}: {param.requires_grad}')
                 elif cfg.learn_input_method == 'spm':
                     if 'prompt_vectors' in name or 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
                         param.requires_grad_(True)
-                        print(f'{name}: {param.requires_grad}')
                 else:
                     raise NotImplementedError
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-                print(f'{name}: {param.requires_grad}')
         elif 'c2c' in name:
             param.requires_grad = True
-            print(f'{name}: {param.requires_grad}')
-        elif 'c_param' in name:
+        # [HYPERBOLIC] Enable gradients for new parameters
+        elif 'curv' in name or 'alpha' in name:
             param.requires_grad = True
-        elif 'visual_alpha' in name or 'textual_alpha' in name:
-            param.requires_grad = True
+            print(f'[Hyperbolic] Enable gradient for {name}')
+            
     return model
