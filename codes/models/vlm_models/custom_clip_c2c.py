@@ -129,20 +129,27 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
 
-        # [HyCoCLIP] Curvature initialization (1.0 as per paper)
-        self.c_param = nn.Parameter(torch.tensor(1e-5).log())
+        # ---------------------------------------------------------------------
+        # [FIX 1] Curvature = 1.0 (Align with H2EM Loss)
+        # ---------------------------------------------------------------------
+        self.c_param = nn.Parameter(torch.tensor(1.0).log())
         self._curv_minmax = {
-            "max": math.log(1.0 * 10), 
-            "min": math.log(1e-7), 
+            "max": math.log(10.0), 
+            "min": math.log(1e-7),
         }
 
-        
-        init_logit_scale = 100
-        print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (PAPER CONFIG: CLIP Default)")
+        # ---------------------------------------------------------------------
+        # [FIX 2] Scale = 14.3 (Prevent Gradient Lock)
+        # ---------------------------------------------------------------------
+        init_logit_scale = 14.3
+        print(f"[CustomCLIP] Initializing Logit Scale to: {init_logit_scale:.4f} (Safe Start)")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
         
-        init_alpha = 1
-        print(f"[CustomCLIP] Initializing visual/textual alpha to {init_alpha:.6f} (PAPER CONFIG: No Scaling)")
+        # ---------------------------------------------------------------------
+        # [FIX 3] Alpha = 0.044 (Prevent Explosion at c=1.0)
+        # ---------------------------------------------------------------------
+        init_alpha = 1.0 / (float(cfg.emb_dim) ** 0.5)
+        print(f"[CustomCLIP] Initializing Alpha to {init_alpha:.6f} (Origin Constraint)")
         self.visual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
         self.textual_alpha = nn.Parameter(torch.tensor(init_alpha).log())
 
@@ -175,20 +182,22 @@ class CustomCLIP(nn.Module):
         self._init_hyperbolic_modules()
 
     def _init_hyperbolic_modules(self):
-        print("[CustomCLIP] Applying Identity Initialization...")
+        print("[CustomCLIP] Applying Random Initialization (NO IDENTITY)...")
+        # ---------------------------------------------------------------------
+        # [FIX 4] REMOVE IDENTITY/DIRAC! USE KAIMING/ORTHOGONAL!
+        # This is CRITICAL for learning temporal features in Conv1d.
+        # ---------------------------------------------------------------------
         for m in [self.c2c_OE1, self.c2c_VE1, self.c2c_text_v, self.c2c_text_o]:
             if isinstance(m, nn.Module):
                 for sub_m in m.modules():
                     if isinstance(sub_m, nn.Linear):
-                        if sub_m.in_features == sub_m.out_features:
-                            nn.init.eye_(sub_m.weight)
-                            sub_m.weight.data.add_(torch.randn_like(sub_m.weight) * 0.001)
-                        else:
-                            nn.init.orthogonal_(sub_m.weight, gain=1.0)
+                        # Orthogonal for Linear
+                        nn.init.orthogonal_(sub_m.weight, gain=1.0)
                         if sub_m.bias is not None:
                             nn.init.constant_(sub_m.bias, 0.0)
                     elif isinstance(sub_m, nn.Conv1d):
-                         nn.init.dirac_(sub_m.weight) 
+                         # Kaiming for Conv (Temporal) - THIS IS THE FIX
+                         nn.init.kaiming_normal_(sub_m.weight, mode='fan_out', nonlinearity='relu')
                          if sub_m.bias is not None:
                             nn.init.constant_(sub_m.bias, 0.0)
                     elif isinstance(sub_m, nn.LayerNorm):
@@ -244,11 +253,9 @@ class CustomCLIP(nn.Module):
         video_features = self.video_encoder(video)
 
         with torch.cuda.amp.autocast(enabled=False):
-            # 钳制曲率，但不钳制 Alpha (Scale)
+            # Clamp curvature (Standard Hyperbolic)
             self.c_param.data = torch.clamp(self.c_param.data, **self._curv_minmax)
             current_c = self.c_param.exp() 
-            
-            # [REMOVED] Alpha clamp (max=0.0) removed to allow learning
             
             verb_text_features = verb_text_features.float()
             obj_text_features = obj_text_features.float()
@@ -269,7 +276,7 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
-            # Soft Scaling
+            # Soft Scaling (Alpha)
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
@@ -297,7 +304,7 @@ class CustomCLIP(nn.Module):
             dist_v = LorentzMath.hyp_distance(v_feat_hyp.unsqueeze(1), verb_text_hyp.unsqueeze(0), c=current_c)
             dist_o = LorentzMath.hyp_distance(o_feat_hyp.unsqueeze(1), obj_text_hyp.unsqueeze(0), c=current_c)
             
-            # [HyCoCLIP Style] Clamp Logit Scale max to ~100 (ln 4.6)
+            # [HyCoCLIP Style] Clamp Logit Scale
             with torch.no_grad():
                 self.logit_scale.clamp_(max=4.6052)
             logit_scale = self.logit_scale.exp()
@@ -371,7 +378,6 @@ def build_model(train_dataset, cfg):
         elif 'c2c' in name:
             param.requires_grad = True
             print(f'{name}: {param.requires_grad}')
-        # [补充] 确保双曲参数可学习
         elif 'c_param' in name:
             param.requires_grad = True
         elif 'visual_alpha' in name or 'textual_alpha' in name:
