@@ -263,6 +263,19 @@ class CustomCLIP(nn.Module):
             comp_v_euc = self.c2c_text_v(comp_backbone)
             comp_o_euc = self.c2c_text_o(comp_backbone)
 
+            # [CRITICAL FIX] 必须在进入双曲空间前进行归一化！
+            # 这能消除 MLP 带来的随机模长噪声，让 Alpha 真正控制双曲半径
+            verb_text_features = F.normalize(verb_text_features, dim=-1)
+            obj_text_features = F.normalize(obj_text_features, dim=-1)
+            o_feat = F.normalize(o_feat, dim=-1)
+            v_feat = F.normalize(v_feat, dim=-1)
+
+            cv_euc = F.normalize(cv_euc, dim=-1)
+            co_euc = F.normalize(co_euc, dim=-1)
+            comp_v_euc = F.normalize(comp_v_euc, dim=-1)
+            comp_o_euc = F.normalize(comp_o_euc, dim=-1)
+
+            # Soft Scaling (Alpha)
             v_scale = self.visual_alpha.exp()
             t_scale = self.textual_alpha.exp()
             
@@ -276,6 +289,7 @@ class CustomCLIP(nn.Module):
             comp_v_euc = comp_v_euc * t_scale
             comp_o_euc = comp_o_euc * t_scale
 
+            # Map to Hyperbolic
             verb_text_hyp = LorentzMath.exp_map_0(verb_text_features, c=current_c)
             obj_text_hyp = LorentzMath.exp_map_0(obj_text_features, c=current_c)
             o_feat_hyp = LorentzMath.exp_map_0(o_feat, c=current_c)
