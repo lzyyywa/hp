@@ -198,7 +198,13 @@ class CustomCLIP(nn.Module):
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
+         
 
+         #进行归一化处理
+        verb_text_features = F.normalize(verb_text_features, dim=-1)
+        obj_text_features = F.normalize(obj_text_features, dim=-1)
+        v_feat = F.normalize(v_feat, dim=-1)
+        o_feat = F.normalize(o_feat, dim=-1)
         # ----------------------------------------------------------------------
         # 2. [HYPERBOLIC] 空间映射 (关键修改点)
         # ----------------------------------------------------------------------
