@@ -22,40 +22,43 @@ def loss_calu(predict, target, config):
     loss_logit_sp = loss_fn(logits_soft_prompt, batch_target)
     loss_att = loss_fn(logits_att, batch_attr)
     loss_obj = loss_fn(logits_obj, batch_obj)
-    loss = loss_logit_df + config.att_obj_w * (loss_att + loss_obj) + config.sp_w * loss_logit_sp
+    
+    # 兼容性处理：如果config没有这些属性，给予默认值
+    att_obj_w = getattr(config, 'att_obj_w', 0.2)
+    sp_w = getattr(config, 'sp_w', 0.0)
+    
+    loss = loss_logit_df + att_obj_w * (loss_att + loss_obj) + sp_w * loss_logit_sp
     return loss
 
 
 # =============================================================================
-# [HYPERBOLIC] 新增损失函数组件
+# [HYPERBOLIC] 新增损失函数组件 (HyCoCLIP / Troika 风格)
 # =============================================================================
 
 class EntailmentConeLoss(nn.Module):
     """
     Hyperbolic Entailment Cone Loss.
     Penalizes child embeddings that fall outside the entailment cone of their parent.
-    Reference: Ganea et al., "Hyperbolic Entailment Cones for Learning Hierarchical Embeddings"
+    Reference: HyCoCLIP Eq. 10
     """
     def __init__(self, margin=0.01):
         super().__init__()
         self.margin = margin
 
-    def forward(self, fine_emb, coarse_emb, curv):
+    def forward(self, child_emb, parent_emb, curv):
         """
         Args:
-            fine_emb: (Batch, Dim) Child concept (e.g., specific action video feature)
-            coarse_emb: (Batch, Dim) Parent concept (e.g., coarse action text feature)
+            child_emb: (Batch, Dim) Child concept (Specific)
+            parent_emb: (Batch, Dim) Parent concept (General)
             curv: curvature scalar
         """
         # Calculate the angle between the two points at the origin
-        angle = L.oxy_angle(coarse_emb, fine_emb, curv)
+        angle = L.oxy_angle(parent_emb, child_emb, curv)
         
         # Calculate the aperture (half-angle) of the cone at the parent
-        # Note: aperture is determined by the norm of the parent
-        aperture = L.half_aperture(coarse_emb, curv)
+        aperture = L.half_aperture(parent_emb, curv)
         
         # Violation: if angle > aperture, the child is outside the cone.
-        # We minimize max(0, angle - aperture + margin)
         violation = torch.clamp(angle - aperture + self.margin, min=0.0)
         
         return violation.mean()
@@ -63,57 +66,75 @@ class EntailmentConeLoss(nn.Module):
 
 def hyperbolic_loss_calu(predict, target, config):
     """
-    专门用于双曲模式的损失计算函数
-    Predict: (verb_logits, obj_logits, com_logits, hyp_features)
-    Target: (batch_img, batch_attr, batch_obj, batch_target, coarse_v_hyp, coarse_o_hyp)
+    Troika-Aligned Hyperbolic Loss Calculation
+    Includes:
+    1. Discriminative Alignment (Hyperbolic Contrastive)
+    2. Hierarchical Entailment (Two-Level Cascade: Video->FineText->CoarseText)
     """
     loss_fn = CrossEntropyLoss()
     entail_loss_fn = EntailmentConeLoss(margin=0.01)
 
-    # 1. Unpack Predictions
+    # 1. Unpack
+    # hyp_feats contains: v_feat_hyp, o_feat_hyp (Video), verb_text_hyp, obj_text_hyp (Fine Text), curv
     logits_v, logits_o, logits_com, hyp_feats = predict
-    
-    # 2. Unpack Targets
-    # 注意：train_models.py 需要被修改以传递 coarse_v_hyp 和 coarse_o_hyp
     batch_img, batch_attr, batch_obj, batch_target, coarse_v_hyp, coarse_o_hyp = target
     
     batch_attr = batch_attr.cuda()
     batch_obj = batch_obj.cuda()
     batch_target = batch_target.cuda()
     
-    # 3. Discriminative Alignment Loss (判别对齐损失)
-    # 在双曲空间中，Logits = -Distance * Scale。
-    # CrossEntropyLoss = -log(softmax(logits)) = -log(softmax(-dist))
-    # 最小化 CE Loss 等价于最大化正确类别的 Logit (即最小化距离)。
-    # 这自然实现了 "Aligning fine-grained video features with fine-grained text features"
+    # =========================================================================
+    # 1. Discriminative Alignment Loss (判别对齐)
+    # =========================================================================
+    # 公式对应: -log(exp(-d_pos)/sum(exp(-d_neg)))
+    # 这正是 CrossEntropy 对 logits (-dist) 的定义，严格对齐 HyCoCLIP Eq. 5
     loss_com = loss_fn(logits_com, batch_target)
     loss_v = loss_fn(logits_v, batch_attr)
     loss_o = loss_fn(logits_o, batch_obj)
     
-    # 4. Hierarchical Entailment Loss (层次蕴含损失)
-    # 约束：Fine Video Feature 应当位于 Coarse Text Feature 的蕴含锥内
+    # 读取权重配置
+    weights = getattr(config, 'loss_weights', {})
+    w_att_obj = weights.get('att_obj_w', 0.2)
+    
+    loss_align_total = loss_com + w_att_obj * (loss_v + loss_o)
+    
+    # =========================================================================
+    # 2. Hierarchical Entailment Loss (层级蕴含 - 双层级联)
+    # =========================================================================
+    # 必须实现完整的层级链: Video (Specific) -> Fine Text (Concept) -> Coarse Text (Category)
+    # 之前的代码漏掉了 Video -> Fine Text 这一层，现已补全。
+    
     curv = hyp_feats['curv']
     
-    # Video-Verb Fine vs Text-Verb Coarse
-    loss_entail_v = entail_loss_fn(hyp_feats['v_feat_hyp'], coarse_v_hyp, curv)
-    # Video-Obj Fine vs Text-Obj Coarse
-    loss_entail_o = entail_loss_fn(hyp_feats['o_feat_hyp'], coarse_o_hyp, curv)
+    # --- Level 1: Video entails Fine Text (Action -> Verb/Object Concept) ---
+    # 视频动词特征 应该在 细粒度动词文本 的锥体内
+    loss_entail_v_1 = entail_loss_fn(hyp_feats['v_feat_hyp'], hyp_feats['verb_text_hyp'], curv)
+    # 视频物品特征 应该在 细粒度物品文本 的锥体内
+    loss_entail_o_1 = entail_loss_fn(hyp_feats['o_feat_hyp'], hyp_feats['obj_text_hyp'], curv)
     
-    loss_entail = loss_entail_v + loss_entail_o
+    # --- Level 2: Fine Text entails Coarse Text (Concept -> Category) ---
+    # 细粒度动词文本 应该在 粗粒度动词原型 的锥体内
+    loss_entail_v_2 = entail_loss_fn(hyp_feats['verb_text_hyp'], coarse_v_hyp, curv)
+    # 细粒度物品文本 应该在 粗粒度物品原型 的锥体内
+    loss_entail_o_2 = entail_loss_fn(hyp_feats['obj_text_hyp'], coarse_o_hyp, curv)
+    
+    # 汇总所有蕴含损失
+    loss_entail_total = (loss_entail_v_1 + loss_entail_o_1 + 
+                         loss_entail_v_2 + loss_entail_o_2)
 
-    # 5. Total Loss
-    # 获取权重参数，如果 config 中没有定义则使用默认值
-    lambda_entail = getattr(config, 'lambda_entail', 0.1) 
+    # =========================================================================
+    # 3. Total Weighted Loss
+    # =========================================================================
+    w_align = weights.get('lambda_align', 1.0)
+    w_entail = weights.get('lambda_entail', 0.1)
     
-    # C2C 原始结构: Composition + 0.2 * (Verb + Obj)
-    # 新增: + lambda * Entailment
-    loss = loss_com + config.att_obj_w * (loss_v + loss_o) + lambda_entail * loss_entail
+    total_loss = w_align * loss_align_total + w_entail * loss_entail_total
     
-    return loss
+    return total_loss
 
 
 # =============================================================================
-# Original Utils (Preserved)
+# Original Utils (Preserved - DO NOT DELETE)
 # =============================================================================
 
 class KLLoss(nn.Module):
