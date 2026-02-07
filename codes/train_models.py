@@ -144,6 +144,8 @@ def encode_coarse_text(model, labels, device, mode='verb'):
         
         # 4. Projection (C2C specific linear layer)
         features = projector(features)
+
+        features = torch.nn.functional.normalize(features, dim=-1) #进行归一化
         
     return features
 
