@@ -145,7 +145,8 @@ def encode_coarse_text(model, labels, device, mode='verb'):
         # 4. Projection (C2C specific linear layer)
         features = projector(features)
 
-        features = torch.nn.functional.normalize(features, dim=-1) #进行归一化
+        # [CRITICAL FIX] 必须移除归一化，防止双曲 NaN
+        # features = torch.nn.functional.normalize(features, dim=-1) 
         
     return features
 
@@ -257,7 +258,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             scaler.scale(loss).backward()
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
+                
+                # [CRITICAL FIX] 必须先 Unscale 变成真实梯度，再 Clip
                 scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
