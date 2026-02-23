@@ -6,7 +6,6 @@ import tqdm
 import test as test
 from loss import *
 from loss import KLLoss
-# [HYPERBOLIC] 引入双曲工具和新损失计算函数
 from loss import hyperbolic_loss_calu
 import utils.hyperbolic_utils as L
 
@@ -16,7 +15,7 @@ import json
 import math
 from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
-from clip import clip  # 需要引入clip进行tokenize
+from clip import clip  
 
 from utils.hsic import hsic_normalized_cca
 
@@ -98,35 +97,6 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 
-def encode_coarse_text(model, labels, device, mode='verb'):
-    prompts = [f"a video of {label}" for label in labels]
-    tokenized = clip.tokenize(prompts).to(device)
-    
-    with torch.no_grad():
-        if mode == 'verb':
-            learner = model.verb_prompt_learner
-            projector = model.c2c_text_v
-        else:
-            learner = model.obj_prompt_learner
-            projector = model.c2c_text_o
-
-        # 【修复】从 text_encoder 中获取正确的半精度类型
-        target_dtype = model.text_encoder.dtype
-
-        embedding = learner.token_embedding(tokenized).type(target_dtype)
-        
-        pos_emb = getattr(learner, 'positional_embedding', None)
-        if pos_emb is None:
-             pass 
-        else:
-             embedding = embedding + pos_emb.type(target_dtype)
-        
-        features = model.text_encoder(embedding, tokenized)
-        features = projector(features)
-        
-    return features
-
-
 def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset,
                 scaler):
     train_dataloader = DataLoader(
@@ -149,17 +119,32 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
 
-    print(">>> [Train] Pre-computing coarse text features for Hyperbolic Entailment...")
+    # =========================================================================
+    # 【核心修复 1】恢复安全的冻结 CLIP 提取，并仅保存 Raw Feature (512维)
+    # =========================================================================
+    print(">>> [Train] Pre-computing coarse text raw features using frozen CLIP...")
     device = torch.device("cuda")
     
-    model_ref = model.module if hasattr(model, 'module') else model
+    frozen_clip, _ = clip.load(config.backbone, device=device)
+    frozen_clip.eval()
     
-    if hasattr(train_dataset, 'coarse_attrs'):
-        coarse_v_euc = encode_coarse_text(model_ref, train_dataset.coarse_attrs, device, mode='verb')
-        coarse_o_euc = encode_coarse_text(model_ref, train_dataset.coarse_objs, device, mode='object')
-        print(f"    Coarse Verbs shape: {coarse_v_euc.shape}, Coarse Objects shape: {coarse_o_euc.shape}")
-    else:
-        raise ValueError("[Error] Dataset missing coarse labels. Cannot run Hierarchical Hyperbolic Training.")
+    with torch.no_grad():
+        v_list = []
+        for cv in train_dataset.coarse_attrs:
+            tokens = clip.tokenize(f"an action of {cv}").cuda()
+            feat = frozen_clip.encode_text(tokens).float()
+            v_list.append(feat)
+        coarse_v_raw = torch.cat(v_list, dim=0)
+
+        o_list = []
+        for co in train_dataset.coarse_objs:
+            tokens = clip.tokenize(f"a photo of a {co}").cuda()
+            feat = frozen_clip.encode_text(tokens).float()
+            o_list.append(feat)
+        coarse_o_raw = torch.cat(o_list, dim=0)
+        
+    del frozen_clip
+    print("    Pre-extraction complete.")
 
     train_losses = []
 
@@ -194,12 +179,16 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 f_filtered = f[:, train_v_inds, train_o_inds]
 
+                # 【核心修复 2】在每一步前向传播中进行投影，确保 c2c_text 层获得梯度！
+                model_ref = model.module if hasattr(model, 'module') else model
+                coarse_v_euc = model_ref.c2c_text_v(coarse_v_raw)
+                coarse_o_euc = model_ref.c2c_text_o(coarse_o_raw)
+
             # ==========================================
             # 2. 必须关闭 FP16，纯 FP32 计算双曲映射和 Loss
             # ==========================================
             with torch.cuda.amp.autocast(enabled=False):
                 _curv = hyp_features['curv'].float()
-                model_ref = model.module if hasattr(model, 'module') else model
                 
                 v_alpha_fp32 = model_ref.text_alpha_v.exp().float()
                 o_alpha_fp32 = model_ref.text_alpha_o.exp().float()
