@@ -70,7 +70,7 @@ train:
   # [CORRECTION] 显式定义所有损失权重
   # Total Loss = lambda_align * (L_com + att_obj_w * (L_verb + L_obj)) + lambda_entail * L_entail
   loss_weights:
-    lambda_align: 1.0   # 判别对齐损失 (Discriminative Alignment) 的总权重
+    lambda_align: 0.1   # 判别对齐损失 (Discriminative Alignment) 的总权重
     lambda_entail: 0.1  # 层次蕴含损失 (Hierarchical Entailment) 的权重
     att_obj_w: 0.2      # 动词/物品组件损失的内部权重 (原基线为0.2)
 
