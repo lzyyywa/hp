@@ -69,7 +69,6 @@ def evaluate(model, dataset, config):
     key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
 
     for key in key_set:
-        # if key in key_set:
         result = result + key + "  " + str(round(test_stats[key], 4)) + "| "
     print(result)
     model.train()
@@ -81,7 +80,6 @@ def save_checkpoint(state, save_path, epoch, best=False):
     torch.save(state, filename)
 
 
-# ========conditional train=
 def rand_bbox(size, lam):
     W = size[-2]
     H = size[-1]
@@ -89,7 +87,6 @@ def rand_bbox(size, lam):
     cut_w = np.int_(W * cut_rat)
     cut_h = np.int_(H * cut_rat)
 
-    # uniform
     cx = np.random.randint(W)
     cy = np.random.randint(H)
 
@@ -101,20 +98,10 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 
-# [HYPERBOLIC] Helper to encode coarse text labels
 def encode_coarse_text(model, labels, device, mode='verb'):
-    """
-    Encodes list of text strings into Euclidean features using the model's text encoder.
-    """
-    # 1. Template & Tokenize
-    # Simple template: "a video of [ACTION]"
     prompts = [f"a video of {label}" for label in labels]
     tokenized = clip.tokenize(prompts).to(device)
     
-    # 2. Embedding (Access internal token_embedding from learner)
-    # Note: Using torch.no_grad() because we don't update text encoder for coarse labels typically
-    # unless we want gradients to flow back through coarse labels to the text encoder.
-    # Given memory constraints, usually no_grad is safer for this auxiliary branch.
     with torch.no_grad():
         if mode == 'verb':
             learner = model.verb_prompt_learner
@@ -123,30 +110,16 @@ def encode_coarse_text(model, labels, device, mode='verb'):
             learner = model.obj_prompt_learner
             projector = model.c2c_text_o
 
-        # We need to use the learner's embedding logic. 
-        # Standard CoOp implementation:
         embedding = learner.token_embedding(tokenized).type(model.dtype)
         
-        # Add positional embedding (borrowed from learner's logic or clip_model)
-        # Try to access positional_embedding from learner (custom_clip_c2c logic)
-        # If not available in learner, we might need to look at how get_text_learner implements it.
-        # For safety/robustness:
         pos_emb = getattr(learner, 'positional_embedding', None)
         if pos_emb is None:
-             # Fallback to model.text_encoder context if needed, but learner usually has it.
-             # Assuming CustomCLIP structure provided previously.
              pass 
         else:
              embedding = embedding + pos_emb.type(model.dtype)
         
-        # 3. Encoder
         features = model.text_encoder(embedding, tokenized)
-        
-        # 4. Projection (C2C specific linear layer)
         features = projector(features)
-
-        # [CRITICAL FIX] 必须移除归一化，防止双曲 NaN
-        # features = torch.nn.functional.normalize(features, dim=-1) 
         
     return features
 
@@ -164,24 +137,18 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     model.train()
     best_loss = 1e5
     best_metric = 0
-    # 这里的 Loss_fn 仅用于日志打印 (logging)
     Loss_fn = CrossEntropyLoss()
     log_training = open(os.path.join(config.save_path, 'log.txt'), 'w')
 
     attr2idx = train_dataset.attr2idx
     obj2idx = train_dataset.obj2idx
 
-    # [IMPORTANT] 获取训练对的索引，用于将 3D Logits 过滤为 2D Class Scores
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
 
-    # =========================================================================
-    # [PURE HYPERBOLIC] 强制预计算粗粒度特征
-    # =========================================================================
     print(">>> [Train] Pre-computing coarse text features for Hyperbolic Entailment...")
     device = torch.device("cuda")
     
-    # Handle DataParallel wrapping
     model_ref = model.module if hasattr(model, 'module') else model
     
     if hasattr(train_dataset, 'coarse_attrs'):
@@ -212,45 +179,54 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
             
-            # 强制解包粗粒度索引
             c_attr_idx = batch[6].cuda()
             c_obj_idx = batch[7].cuda()
 
+            # ==========================================
+            # 1. 允许在 FP16 下提取欧式特征
+            # ==========================================
             with torch.cuda.amp.autocast(enabled=True):
-                # Forward Pass (Pure Hyperbolic)
-                # outputs: (verb_logits, obj_logits, pred_com, hyp_features)
                 p_v, p_o, f, hyp_features = model(batch_img)
                 
-                # [CORRECTION] 关键修复：利用 train_pairs 过滤组合 Logits
-                # f (pred_com) shape: [Batch, N_Verb, N_Obj] (3D)
-                # f_filtered shape: [Batch, N_Valid_Train_Pairs] (2D)
-                # batch_target contains indices in [0, N_Valid_Train_Pairs-1]
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 f_filtered = f[:, train_v_inds, train_o_inds]
 
-                # Dynamic Mapping of Coarse Features (using updated curv/alpha)
-                _curv = hyp_features['curv']
+            # ==========================================
+            # 2. 必须关闭 FP16，纯 FP32 计算双曲映射和 Loss
+            # ==========================================
+            with torch.cuda.amp.autocast(enabled=False):
+                _curv = hyp_features['curv'].float()
                 model_ref = model.module if hasattr(model, 'module') else model
                 
-                all_coarse_v_hyp = L.exp_map0(coarse_v_euc * model_ref.text_alpha_v.exp(), _curv)
-                all_coarse_o_hyp = L.exp_map0(coarse_o_euc * model_ref.text_alpha_o.exp(), _curv)
+                v_alpha_fp32 = model_ref.text_alpha_v.exp().float()
+                o_alpha_fp32 = model_ref.text_alpha_o.exp().float()
+                
+                all_coarse_v_hyp = L.exp_map0(coarse_v_euc.float() * v_alpha_fp32, _curv)
+                all_coarse_o_hyp = L.exp_map0(coarse_o_euc.float() * o_alpha_fp32, _curv)
                 
                 batch_coarse_v = all_coarse_v_hyp[c_attr_idx]
                 batch_coarse_o = all_coarse_o_hyp[c_obj_idx]
                 
-                # Loss Calculation
                 target_pack = (batch_img, batch_verb, batch_obj, batch_target, batch_coarse_v, batch_coarse_o)
-                # 注意：这里传递的是 filtered 之后的 f_filtered
-                predict_pack = (p_v, p_o, f_filtered, hyp_features)
                 
-                # 计算总损失 (包含 Align + Entail)
+                # 转换 hyp_features 内容为 fp32
+                hyp_features_fp32 = {
+                    'v_feat_hyp': hyp_features['v_feat_hyp'].float(),
+                    'o_feat_hyp': hyp_features['o_feat_hyp'].float(),
+                    'verb_text_hyp': hyp_features['verb_text_hyp'].float(),
+                    'obj_text_hyp': hyp_features['obj_text_hyp'].float(),
+                    'curv': _curv
+                }
+                
+                predict_pack = (p_v.float(), p_o.float(), f_filtered.float(), hyp_features_fp32)
+                
+                # 计算损失（内部已含 * 20.0 缩放）
                 loss = hyperbolic_loss_calu(predict_pack, target_pack, config)
                 
-                # For Logging only (Raw logits -> CE Loss)
-                # 使用 f_filtered 确保维度匹配
-                loss_com = Loss_fn(f_filtered, batch_target)
-                loss_verb = Loss_fn(p_v, batch_verb)
-                loss_obj = Loss_fn(p_o, batch_obj)
+                # 日志打印（显式转 fp32 并 * 20.0）
+                loss_com = Loss_fn(f_filtered.float() * 20.0, batch_target)
+                loss_verb = Loss_fn(p_v.float() * 20.0, batch_verb)
+                loss_obj = Loss_fn(p_o.float() * 20.0, batch_obj)
 
                 loss = loss / config.gradient_accumulation_steps
 
@@ -259,9 +235,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
                 
-                # [CRITICAL FIX] 必须先 Unscale 变成真实梯度，再 Clip
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # 【对齐上一版】加入梯度截断保护双曲流形
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
@@ -277,7 +253,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         lr_scheduler.step()
         progress_bar.close()
-        # Logging ... (保持原样)
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
         train_losses.append(np.mean(epoch_train_losses))
         log_training.write('\n')
