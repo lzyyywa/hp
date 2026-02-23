@@ -61,7 +61,12 @@ class EntailmentConeLoss(nn.Module):
         # Violation: if angle > aperture, the child is outside the cone.
         violation = torch.clamp(angle - aperture + self.margin, min=0.0)
         
-        return violation.mean()
+        norm_child = torch.norm(child_emb, dim=-1)
+        norm_parent = torch.norm(parent_emb, dim=-1)
+        norm_penalty = torch.clamp(norm_parent - norm_child, min=0.0)
+        
+        # 【对齐上一版】严格保持 0.1 的范数惩罚权重
+        return (violation + 0.1 * norm_penalty).mean()
 
 
 def hyperbolic_loss_calu(predict, target, config):
@@ -75,7 +80,6 @@ def hyperbolic_loss_calu(predict, target, config):
     entail_loss_fn = EntailmentConeLoss(margin=0.01)
 
     # 1. Unpack
-    # hyp_feats contains: v_feat_hyp, o_feat_hyp (Video), verb_text_hyp, obj_text_hyp (Fine Text), curv
     logits_v, logits_o, logits_com, hyp_feats = predict
     batch_img, batch_attr, batch_obj, batch_target, coarse_v_hyp, coarse_o_hyp = target
     
@@ -86,13 +90,11 @@ def hyperbolic_loss_calu(predict, target, config):
     # =========================================================================
     # 1. Discriminative Alignment Loss (判别对齐)
     # =========================================================================
-    # 公式对应: -log(exp(-d_pos)/sum(exp(-d_neg)))
-    # 这正是 CrossEntropy 对 logits (-dist) 的定义，严格对齐 HyCoCLIP Eq. 5
-    loss_com = loss_fn(logits_com, batch_target)
-    loss_v = loss_fn(logits_v, batch_attr)
-    loss_o = loss_fn(logits_o, batch_obj)
+    # 【核心修复】显式转为 FP32 并使用 20.0 的温度缩放，对齐上一版
+    loss_com = loss_fn(logits_com.float() * 20.0, batch_target)
+    loss_v = loss_fn(logits_v.float() * 20.0, batch_attr)
+    loss_o = loss_fn(logits_o.float() * 20.0, batch_obj)
     
-    # 读取权重配置
     weights = getattr(config, 'loss_weights', {})
     w_att_obj = weights.get('att_obj_w', 0.2)
     
@@ -101,32 +103,23 @@ def hyperbolic_loss_calu(predict, target, config):
     # =========================================================================
     # 2. Hierarchical Entailment Loss (层级蕴含 - 双层级联)
     # =========================================================================
-    # 必须实现完整的层级链: Video (Specific) -> Fine Text (Concept) -> Coarse Text (Category)
-    # 之前的代码漏掉了 Video -> Fine Text 这一层，现已补全。
-    
     curv = hyp_feats['curv']
     
     # --- Level 1: Video entails Fine Text (Action -> Verb/Object Concept) ---
-    # 视频动词特征 应该在 细粒度动词文本 的锥体内
     loss_entail_v_1 = entail_loss_fn(hyp_feats['v_feat_hyp'], hyp_feats['verb_text_hyp'], curv)
-    # 视频物品特征 应该在 细粒度物品文本 的锥体内
     loss_entail_o_1 = entail_loss_fn(hyp_feats['o_feat_hyp'], hyp_feats['obj_text_hyp'], curv)
     
     # --- Level 2: Fine Text entails Coarse Text (Concept -> Category) ---
-    # 细粒度动词文本 应该在 粗粒度动词原型 的锥体内
     loss_entail_v_2 = entail_loss_fn(hyp_feats['verb_text_hyp'], coarse_v_hyp, curv)
-    # 细粒度物品文本 应该在 粗粒度物品原型 的锥体内
     loss_entail_o_2 = entail_loss_fn(hyp_feats['obj_text_hyp'], coarse_o_hyp, curv)
     
-    # 汇总所有蕴含损失
-    loss_entail_total = (loss_entail_v_1 + loss_entail_o_1 + 
-                         loss_entail_v_2 + loss_entail_o_2)
+    loss_entail_total = (loss_entail_v_1 + loss_entail_o_1 + loss_entail_v_2 + loss_entail_o_2)
 
     # =========================================================================
     # 3. Total Weighted Loss
     # =========================================================================
     w_align = weights.get('lambda_align', 1.0)
-    w_entail = weights.get('lambda_entail', 0.1)
+    w_entail = weights.get('lambda_entail', 0.1)  # 根据config，这里是0.1
     
     total_loss = w_align * loss_align_total + w_entail * loss_entail_total
     
@@ -138,15 +131,6 @@ def hyperbolic_loss_calu(predict, target, config):
 # =============================================================================
 
 class KLLoss(nn.Module):
-    """Loss that uses a 'hinge' on the lower bound.
-    This means that for samples with a label value smaller than the threshold, the loss is zero if the prediction is
-    also smaller than that threshold.
-    args:
-        error_matric:  What base loss to use (MSE by default).
-        threshold:  Threshold to use for the hinge.
-        clip:  Clip the loss if it is above this value.
-    """
-
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
         super().__init__()
         print('=========using KL Loss=and has temperature and * bz==========')
@@ -177,20 +161,13 @@ def hsic_loss(input1, input2, unbiased=False):
     N = len(input1)
     if N < 4:
         return torch.tensor(0.0).to(input1.device)
-    # we simply use the squared dimension of feature as the sigma for RBF kernel
     sigma_x = np.sqrt(input1.size()[1])
     sigma_y = np.sqrt(input2.size()[1])
 
-    # compute the kernels
     kernel_XX = _kernel(input1, sigma_x)
     kernel_YY = _kernel(input2, sigma_y)
 
     if unbiased:
-        """Unbiased estimator of Hilbert-Schmidt Independence Criterion
-        Song, Le, et al. "Feature selection via dependence maximization." 2012.
-        """
-        # tK = kernel_XX - torch.diag(torch.diag(kernel_XX))
-        # tL = kernel_YY - torch.diag(torch.diag(kernel_YY))
         tK = kernel_XX - torch.diag(kernel_XX)
         tL = kernel_YY - torch.diag(kernel_YY)
         hsic = (
@@ -200,9 +177,6 @@ def hsic_loss(input1, input2, unbiased=False):
         )
         loss = hsic / (N * (N - 3))
     else:
-        """Biased estimator of Hilbert-Schmidt Independence Criterion
-        Gretton, Arthur, et al. "Measuring statistical dependence with Hilbert-Schmidt norms." 2005.
-        """
         KH = kernel_XX - kernel_XX.mean(0, keepdim=True)
         LH = kernel_YY - kernel_YY.mean(0, keepdim=True)
         loss = torch.trace(KH @ LH / (N - 1) ** 2)
@@ -210,36 +184,22 @@ def hsic_loss(input1, input2, unbiased=False):
 
 
 class Gml_loss(nn.Module):
-    """Loss that uses a 'hinge' on the lower bound.
-    Loss from No One Left Behind: Improving the Worst Categories in Long-Tailed Learning
-    """
-
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
         super().__init__()
 
     def forward(self, p_o_on_v, v_label, n_c, t=100.0):
-        '''
-
-        Args:
-            p_o_on_v: b,n_v,n_o
-            o_label: b,
-            n_c: b,n_o
-
-        Returns:
-
-        '''
         n_c = n_c[:, 0]
         b = p_o_on_v.shape[0]
         n_o = p_o_on_v.shape[-1]
-        p_o = p_o_on_v[range(b), v_label, :]  # b,n_o
+        p_o = p_o_on_v[range(b), v_label, :]  
 
-        num_c = n_c.sum().view(1, -1)  # 1,n_o
+        num_c = n_c.sum().view(1, -1)  
 
         p_o_exp = torch.exp(p_o * t)
-        p_o_exp_wed = num_c * p_o_exp  # b,n_o
-        p_phi = p_o_exp_wed / torch.sum(p_o_exp_wed, dim=0, keepdim=True)  # b,n_o
+        p_o_exp_wed = num_c * p_o_exp  
+        p_phi = p_o_exp_wed / torch.sum(p_o_exp_wed, dim=0, keepdim=True)  
 
-        p_ba = torch.sum(p_phi * n_c, dim=0, keepdim=True) / (num_c + 1.0e-6)  # 1,n_o
+        p_ba = torch.sum(p_phi * n_c, dim=0, keepdim=True) / (num_c + 1.0e-6)  
         p_ba[torch.where(p_ba < 1.0e-8)] = 1.0
         p_ba_log = torch.log(p_ba)
         loss = (-1.0 / n_o) * p_ba_log.sum()
