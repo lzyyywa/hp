@@ -23,9 +23,9 @@ def loss_calu(predict, target, config):
     loss_att = loss_fn(logits_att, batch_attr)
     loss_obj = loss_fn(logits_obj, batch_obj)
     
-    # 兼容性处理：如果config没有这些属性，给予默认值
-    att_obj_w = getattr(config, 'att_obj_w', 0.2)
-    sp_w = getattr(config, 'sp_w', 0.0)
+    # 强制读取，找不到直接报错
+    att_obj_w = config.att_obj_w
+    sp_w = getattr(config, 'sp_w', 0.0) # 这个是原版遗留的 soft prompt，保持原样防错
     
     loss = loss_logit_df + att_obj_w * (loss_att + loss_obj) + sp_w * loss_logit_sp
     return loss
@@ -90,13 +90,14 @@ def hyperbolic_loss_calu(predict, target, config):
     # =========================================================================
     # 1. Discriminative Alignment Loss (判别对齐)
     # =========================================================================
-    # 【核心修复】显式转为 FP32 并使用 20.0 的温度缩放，对齐上一版
+    # 显式转为 FP32 并使用 20.0 的温度缩放，对齐上一版
     loss_com = loss_fn(logits_com.float() * 20.0, batch_target)
     loss_v = loss_fn(logits_v.float() * 20.0, batch_attr)
     loss_o = loss_fn(logits_o.float() * 20.0, batch_obj)
     
-    weights = getattr(config, 'loss_weights', {})
-    w_att_obj = weights.get('att_obj_w', 0.2)
+    # 【修改：强制读取配置字典，如果 config 里没写就会抛出 AttributeError 或 KeyError】
+    weights = config.loss_weights
+    w_att_obj = weights['att_obj_w']
     
     loss_align_total = loss_com + w_att_obj * (loss_v + loss_o)
     
@@ -105,21 +106,26 @@ def hyperbolic_loss_calu(predict, target, config):
     # =========================================================================
     curv = hyp_feats['curv']
     
+    # 利用当前 batch 的 label 对全量文本特征进行索引
+    batch_fine_v_hyp = hyp_feats['verb_text_hyp'][batch_attr]
+    batch_fine_o_hyp = hyp_feats['obj_text_hyp'][batch_obj]
+    
     # --- Level 1: Video entails Fine Text (Action -> Verb/Object Concept) ---
-    loss_entail_v_1 = entail_loss_fn(hyp_feats['v_feat_hyp'], hyp_feats['verb_text_hyp'], curv)
-    loss_entail_o_1 = entail_loss_fn(hyp_feats['o_feat_hyp'], hyp_feats['obj_text_hyp'], curv)
+    loss_entail_v_1 = entail_loss_fn(hyp_feats['v_feat_hyp'], batch_fine_v_hyp, curv)
+    loss_entail_o_1 = entail_loss_fn(hyp_feats['o_feat_hyp'], batch_fine_o_hyp, curv)
     
     # --- Level 2: Fine Text entails Coarse Text (Concept -> Category) ---
-    loss_entail_v_2 = entail_loss_fn(hyp_feats['verb_text_hyp'], coarse_v_hyp, curv)
-    loss_entail_o_2 = entail_loss_fn(hyp_feats['obj_text_hyp'], coarse_o_hyp, curv)
+    loss_entail_v_2 = entail_loss_fn(batch_fine_v_hyp, coarse_v_hyp, curv)
+    loss_entail_o_2 = entail_loss_fn(batch_fine_o_hyp, coarse_o_hyp, curv)
     
     loss_entail_total = (loss_entail_v_1 + loss_entail_o_1 + loss_entail_v_2 + loss_entail_o_2)
 
     # =========================================================================
     # 3. Total Weighted Loss
     # =========================================================================
-    w_align = weights.get('lambda_align', 1.0)
-    w_entail = weights.get('lambda_entail', 0.1)  # 根据config，这里是0.1
+    # 【修改：强制字典取值，拒绝使用默认值】
+    w_align = weights['lambda_align']
+    w_entail = weights['lambda_entail']
     
     total_loss = w_align * loss_align_total + w_entail * loss_entail_total
     
