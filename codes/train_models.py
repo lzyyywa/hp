@@ -110,13 +110,16 @@ def encode_coarse_text(model, labels, device, mode='verb'):
             learner = model.obj_prompt_learner
             projector = model.c2c_text_o
 
-        embedding = learner.token_embedding(tokenized).type(model.dtype)
+        # 【修复】从 text_encoder 中获取正确的半精度类型
+        target_dtype = model.text_encoder.dtype
+
+        embedding = learner.token_embedding(tokenized).type(target_dtype)
         
         pos_emb = getattr(learner, 'positional_embedding', None)
         if pos_emb is None:
              pass 
         else:
-             embedding = embedding + pos_emb.type(model.dtype)
+             embedding = embedding + pos_emb.type(target_dtype)
         
         features = model.text_encoder(embedding, tokenized)
         features = projector(features)
